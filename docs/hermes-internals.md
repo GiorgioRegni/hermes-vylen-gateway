@@ -155,6 +155,25 @@ Watch for:
 - `Plugin 'X' has no register() function` → fix entry-point to point at module, not function
 - `Failed to create adapter for platform 'X': ...` → adapter `__init__` error
 
+### Chat returns "Vylen API request failed with 403"
+
+Three distinct causes, in order of how often we've hit them:
+
+1. **Conversation bound to an instance owned by a different user** — the cloud's `proxyHermes` returns 403 on owner mismatch. Confirm by comparing the conversation's `instance_id` (in `localStorage.vylen.conversations.v1`) against `curl /v1/instances` for each user. The `clearConversationInstance` auto-heal in `useHermesStream` drops the binding so the next pick from the UI works; if you keep retrying the same dead conversation it'll keep failing.
+
+2. **`Origin` header forwarded to Hermes** — Hermes's API server rejects browser-style `Origin` / `Referer` / `Sec-Fetch-*` headers with 403 (CSRF defense). The relay strips these explicitly in `relay._DROP_REQUEST_HEADERS`. Smoke this differential with curl:
+   ```bash
+   curl -X POST .../v1/responses -H 'Content-Type: application/json' -d '{"input":"hi","stream":true}'
+   # vs
+   curl -X POST .../v1/responses -H 'Content-Type: application/json' -H 'Origin: http://example' -d '{"input":"hi","stream":true}'
+   ```
+   If the second 403s and the first 200s, a browser-style header is being passed through to Hermes — add it to the drop-list.
+
+3. **Local Hermes API key mismatch** — Hermes returns 403 when `Authorization: Bearer <key>` doesn't match the one configured in its `config.yaml` / env. Confirm `$VYLEN_HERMES_API_KEY` inside the container equals what Hermes expects:
+   ```bash
+   docker compose exec hermes printenv VYLEN_HERMES_API_KEY API_SERVER_KEY
+   ```
+
 Plugin loads but won't connect? Run the doctor:
 
 ```bash
