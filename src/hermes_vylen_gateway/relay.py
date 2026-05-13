@@ -39,9 +39,11 @@ class HermesRelay:
         self,
         send_frame: Callable[[dict[str, Any]], Awaitable[None]],
         hermes_url: str | None = None,
+        hermes_api_key: str | None = None,
     ):
         self._send = send_frame
         self._hermes_url = (hermes_url or os.environ.get("VYLEN_HERMES_URL", DEFAULT_HERMES_URL)).rstrip("/")
+        self._hermes_api_key = (hermes_api_key or os.environ.get("VYLEN_HERMES_API_KEY", "")).strip()
         self._client = httpx.AsyncClient(timeout=None)
         self._tasks: set[asyncio.Task] = set()
 
@@ -83,6 +85,11 @@ class HermesRelay:
 
         url = self._hermes_url + path
         forwarded = _filter_request_headers(headers)
+        if self._hermes_api_key and "authorization" not in {k.lower() for k in forwarded}:
+            # Local Hermes API is bearer-authenticated in compose setups.
+            # Surface the key from env so the plugin can satisfy that
+            # without the upstream client knowing about it.
+            forwarded["Authorization"] = f"Bearer {self._hermes_api_key}"
         logger.debug("relay -> %s %s (request_id=%s)", method, url, request_id)
         try:
             async with self._client.stream(
