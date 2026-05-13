@@ -31,6 +31,7 @@ vylen = "hermes_vylen_gateway:register"
 
 [project.scripts]
 vylen-gateway-doctor = "hermes_vylen_gateway.doctor:main"
+vylen-gateway-pair = "hermes_vylen_gateway.pair:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
