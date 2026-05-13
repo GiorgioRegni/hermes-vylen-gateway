@@ -131,12 +131,25 @@ class HermesRelay:
         })
 
 
+_DROP_REQUEST_HEADERS = {
+    # Hop-by-hop.
+    "host", "connection", "content-length", "transfer-encoding",
+    "upgrade", "keep-alive", "te", "trailer",
+    # Browser-only metadata. Hermes's API server treats Origin (and some
+    # security-fetch headers) as CSRF signals — forwarding what the browser
+    # sent for `localhost:8421` makes Hermes return 403 on perfectly valid
+    # requests. Strip them before relaying.
+    "origin", "referer", "cookie",
+    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+}
+
+
 def _filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
     """Forward only safe, semantically meaningful request headers to Hermes."""
     out = {}
     for k, v in headers.items():
-        kl = k.lower()
-        if kl in {"host", "connection", "content-length", "transfer-encoding"}:
+        if k.lower() in _DROP_REQUEST_HEADERS:
             continue
         out[k] = v
     return out
