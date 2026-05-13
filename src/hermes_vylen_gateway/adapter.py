@@ -49,41 +49,24 @@ def make_adapter_class():
             self._instance_id: str | None = None
             self._relay: HermesRelay | None = None
             self._health: HealthReporter | None = None
+            self._stopping = False
 
         async def connect(self) -> bool:
             try:
-                gateway_cfg = load_from_env()
+                load_from_env()
             except ConfigError as exc:
                 logger.error("Vylen gateway config invalid: %s", exc)
                 return False
-
-            self._client = VylenGatewayClient(gateway_cfg)
-            try:
-                ready = await self._client.connect()
-            except HandshakeError as exc:
-                logger.error("Vylen gateway handshake failed: %s", exc)
-                await self._client.close()
-                self._client = None
-                return False
-            self._instance_id = ready.instance_id
-            self._relay = HermesRelay(self._client.send)
-            self._health = HealthReporter(
-                self._client.send,
-                hermes_url=self._relay.hermes_url,
-                hermes_api_key=os.environ.get("VYLEN_HERMES_API_KEY") or None,
-            )
-            self._health.start()
-            self._task = asyncio.create_task(self._read_loop())
-            logger.info(
-                "Vylen gateway online: instance_id=%s user_id=%s hermes=%s",
-                ready.instance_id, ready.user_id, self._relay.hermes_url,
-            )
+            self._stopping = False
+            # Start the supervisor; it owns the WS lifecycle and reconnects
+            # the socket on every drop. Initial dial happens in the loop so
+            # connect() returns True immediately even if the cloud is briefly
+            # unreachable at boot.
+            self._task = asyncio.create_task(self._supervisor())
             return True
 
         async def disconnect(self) -> None:
-            if self._health:
-                await self._health.stop()
-                self._health = None
+            self._stopping = True
             if self._task:
                 self._task.cancel()
                 try:
@@ -91,6 +74,67 @@ def make_adapter_class():
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
                 self._task = None
+            await self._teardown_session()
+
+        async def _supervisor(self) -> None:
+            backoff = 1.0
+            while not self._stopping:
+                if not await self._open_session():
+                    # Failed to dial. Backoff up to 60s.
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2.0, 60.0)
+                    continue
+                backoff = 1.0
+                # Pump frames until the socket dies, then loop and reconnect.
+                assert self._client is not None and self._relay is not None
+                relay = self._relay
+
+                async def on_frame(frame):
+                    if frame.get("type") == FRAME_REQUEST:
+                        await relay.handle(frame)
+
+                try:
+                    await self._client.iter_frames(on_frame)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("Vylen gateway socket dropped: %s", exc)
+                await self._teardown_session()
+                if self._stopping:
+                    return
+                logger.info("Vylen gateway reconnecting in %.1fs", backoff)
+                await asyncio.sleep(backoff)
+
+        async def _open_session(self) -> bool:
+            try:
+                gateway_cfg = load_from_env()
+            except ConfigError as exc:
+                logger.error("Vylen gateway config invalid: %s", exc)
+                return False
+            client = VylenGatewayClient(gateway_cfg)
+            try:
+                ready = await client.connect()
+            except HandshakeError as exc:
+                logger.warning("Vylen gateway handshake failed: %s", exc)
+                await client.close()
+                return False
+            self._client = client
+            self._instance_id = ready.instance_id
+            self._relay = HermesRelay(client.send)
+            self._health = HealthReporter(
+                client.send,
+                hermes_url=self._relay.hermes_url,
+                hermes_api_key=os.environ.get("VYLEN_HERMES_API_KEY") or None,
+            )
+            self._health.start()
+            logger.info(
+                "Vylen gateway online: instance_id=%s user_id=%s hermes=%s",
+                ready.instance_id, ready.user_id, self._relay.hermes_url,
+            )
+            return True
+
+        async def _teardown_session(self) -> None:
+            if self._health:
+                await self._health.stop()
+                self._health = None
             if self._relay:
                 await self._relay.close()
                 self._relay = None
@@ -107,20 +151,6 @@ def make_adapter_class():
 
         async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
             return {"name": "vylen", "type": "dm"}
-
-        async def _read_loop(self) -> None:
-            assert self._client is not None
-            assert self._relay is not None
-            relay = self._relay
-
-            async def on_frame(frame):
-                if frame.get("type") == FRAME_REQUEST:
-                    await relay.handle(frame)
-
-            try:
-                await self._client.iter_frames(on_frame)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Vylen gateway read loop exited: %s", exc)
 
     return VylenGatewayAdapter
 
