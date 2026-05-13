@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from .client import HandshakeError, VylenGatewayClient
 from .config import ConfigError, load_from_env
+from .health import HealthReporter
 from .relay import FRAME_REQUEST, HermesRelay
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,7 @@ def make_adapter_class():
             self._task: asyncio.Task | None = None
             self._instance_id: str | None = None
             self._relay: HermesRelay | None = None
+            self._health: HealthReporter | None = None
 
         async def connect(self) -> bool:
             try:
@@ -64,6 +67,12 @@ def make_adapter_class():
                 return False
             self._instance_id = ready.instance_id
             self._relay = HermesRelay(self._client.send)
+            self._health = HealthReporter(
+                self._client.send,
+                hermes_url=self._relay.hermes_url,
+                hermes_api_key=os.environ.get("VYLEN_HERMES_API_KEY") or None,
+            )
+            self._health.start()
             self._task = asyncio.create_task(self._read_loop())
             logger.info(
                 "Vylen gateway online: instance_id=%s user_id=%s hermes=%s",
@@ -72,6 +81,9 @@ def make_adapter_class():
             return True
 
         async def disconnect(self) -> None:
+            if self._health:
+                await self._health.stop()
+                self._health = None
             if self._task:
                 self._task.cancel()
                 try:
