@@ -17,6 +17,7 @@ from .client import HandshakeError, VylenGatewayClient
 from .config import ConfigError, load_from_env
 from .health import HealthReporter
 from .relay import FRAME_REQUEST, HermesRelay
+from .transcribe import FRAME_TRANSCRIBE, Transcriber
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ def make_adapter_class():
             self._instance_id: str | None = None
             self._relay: HermesRelay | None = None
             self._health: HealthReporter | None = None
+            self._transcribe: Transcriber | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
@@ -88,10 +90,14 @@ def make_adapter_class():
                 # Pump frames until the socket dies, then loop and reconnect.
                 assert self._client is not None and self._relay is not None
                 relay = self._relay
+                transcriber = self._transcribe
 
                 async def on_frame(frame):
-                    if frame.get("type") == FRAME_REQUEST:
+                    t = frame.get("type")
+                    if t == FRAME_REQUEST:
                         await relay.handle(frame)
+                    elif t == FRAME_TRANSCRIBE and transcriber is not None:
+                        await transcriber.handle(frame)
 
                 try:
                     await self._client.iter_frames(on_frame)
@@ -125,6 +131,7 @@ def make_adapter_class():
                 hermes_api_key=os.environ.get("VYLEN_HERMES_API_KEY") or None,
             )
             self._health.start()
+            self._transcribe = Transcriber(client.send)
             logger.info(
                 "Vylen gateway online: instance_id=%s user_id=%s hermes=%s",
                 ready.instance_id, ready.user_id, self._relay.hermes_url,
@@ -132,6 +139,9 @@ def make_adapter_class():
             return True
 
         async def _teardown_session(self) -> None:
+            if self._transcribe:
+                await self._transcribe.close()
+                self._transcribe = None
             if self._health:
                 await self._health.stop()
                 self._health = None
