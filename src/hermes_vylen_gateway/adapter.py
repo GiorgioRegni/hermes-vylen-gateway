@@ -38,7 +38,10 @@ def make_adapter_class():
         """
 
         def __init__(self, config, platform=None):
-            super().__init__(config, platform or Platform.GENERIC)
+            # Platform("vylen") goes through Platform._missing_ which returns
+            # the pseudo-member the platform_registry already created when
+            # register(ctx) ran. Identity-stable across calls.
+            super().__init__(config, platform or Platform("vylen"))
             self._client: VylenGatewayClient | None = None
             self._task: asyncio.Task | None = None
             self._instance_id: str | None = None

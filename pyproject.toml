@@ -27,7 +27,9 @@ dev = [
 # then runs `hermes gateway`, the loader imports our module and calls
 # register(ctx). See hermes_cli/plugins.py ENTRY_POINTS_GROUP.
 [project.entry-points."hermes_agent.plugins"]
-vylen = "hermes_vylen_gateway:register"
+# Hermes's plugin loader does ep.load() then getattr(module, "register"),
+# so the entry-point must point to the module (not the function itself).
+vylen = "hermes_vylen_gateway"
 
 [project.scripts]
 vylen-gateway-doctor = "hermes_vylen_gateway.doctor:main"
