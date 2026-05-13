@@ -1,0 +1,146 @@
+"""HTTP-tunnel relay: bridges gateway WS request frames to a local Hermes
+HTTP API, streaming the response chunks back as WS response frames.
+
+This is the chat path. Cron push and multimodal-via-MessageEvent are a
+different code path (checkpoint 6) that uses `BasePlatformAdapter.send` style
+callbacks rather than HTTP-tunneling.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import os
+from typing import Any, Awaitable, Callable
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+# Frame type constants — keep in sync with cloud/internal/cloud/gateway.go.
+FRAME_REQUEST = "request"
+FRAME_RESPONSE_HEADERS = "response_headers"
+FRAME_RESPONSE_CHUNK = "response_chunk"
+FRAME_RESPONSE_END = "response_end"
+FRAME_RESPONSE_ERROR = "response_error"
+
+DEFAULT_HERMES_URL = "http://127.0.0.1:8000"
+
+
+class HermesRelay:
+    """Routes a single inbound `request` frame to local Hermes and streams the
+    response back. Each request runs in its own asyncio task; the relay is
+    owned by the adapter for the lifetime of the gateway socket.
+    """
+
+    def __init__(
+        self,
+        send_frame: Callable[[dict[str, Any]], Awaitable[None]],
+        hermes_url: str | None = None,
+    ):
+        self._send = send_frame
+        self._hermes_url = (hermes_url or os.environ.get("VYLEN_HERMES_URL", DEFAULT_HERMES_URL)).rstrip("/")
+        self._client = httpx.AsyncClient(timeout=None)
+        self._tasks: set[asyncio.Task] = set()
+
+    @property
+    def hermes_url(self) -> str:
+        return self._hermes_url
+
+    async def handle(self, frame: dict[str, Any]) -> None:
+        """Schedule one request. Returns immediately; reply happens in the
+        background so the read loop stays free for the next frame."""
+        request_id = frame.get("request_id") or ""
+        if not request_id:
+            logger.warning("relay: request frame missing request_id, dropping")
+            return
+        task = asyncio.create_task(self._run(request_id, frame))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def close(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
+        for task in list(self._tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        await self._client.aclose()
+
+    async def _run(self, request_id: str, frame: dict[str, Any]) -> None:
+        method = frame.get("method") or "GET"
+        path = frame.get("path") or "/"
+        body_b64 = frame.get("body") or ""
+        headers = frame.get("headers") or {}
+        try:
+            body = base64.b64decode(body_b64) if body_b64 else b""
+        except Exception as exc:  # noqa: BLE001
+            await self._send_error(request_id, "BAD_REQUEST", f"could not decode body: {exc}")
+            return
+
+        url = self._hermes_url + path
+        forwarded = _filter_request_headers(headers)
+        logger.debug("relay -> %s %s (request_id=%s)", method, url, request_id)
+        try:
+            async with self._client.stream(
+                method, url, content=body, headers=forwarded
+            ) as resp:
+                await self._send({
+                    "type": FRAME_RESPONSE_HEADERS,
+                    "request_id": request_id,
+                    "status": resp.status_code,
+                    "headers": _filter_response_headers(dict(resp.headers)),
+                })
+                async for chunk in resp.aiter_raw():
+                    if not chunk:
+                        continue
+                    await self._send({
+                        "type": FRAME_RESPONSE_CHUNK,
+                        "request_id": request_id,
+                        "data": base64.b64encode(chunk).decode("ascii"),
+                    })
+                await self._send({
+                    "type": FRAME_RESPONSE_END,
+                    "request_id": request_id,
+                })
+        except httpx.HTTPError as exc:
+            logger.warning("relay error for %s %s: %s", method, url, exc)
+            await self._send_error(request_id, "HERMES_UNREACHABLE", str(exc))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("relay crashed for %s %s", method, url)
+            await self._send_error(request_id, "RELAY_ERROR", str(exc))
+
+    async def _send_error(self, request_id: str, code: str, message: str) -> None:
+        await self._send({
+            "type": FRAME_RESPONSE_ERROR,
+            "request_id": request_id,
+            "code": code,
+            "message": message,
+        })
+
+
+def _filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Forward only safe, semantically meaningful request headers to Hermes."""
+    out = {}
+    for k, v in headers.items():
+        kl = k.lower()
+        if kl in {"host", "connection", "content-length", "transfer-encoding"}:
+            continue
+        out[k] = v
+    return out
+
+
+def _filter_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Strip hop-by-hop headers from Hermes's response before forwarding."""
+    out = {}
+    for k, v in headers.items():
+        kl = k.lower()
+        if kl in {"connection", "transfer-encoding", "content-length"}:
+            continue
+        out[k] = v
+    return out

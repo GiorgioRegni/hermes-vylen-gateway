@@ -14,6 +14,7 @@ from typing import Any
 
 from .client import HandshakeError, VylenGatewayClient
 from .config import ConfigError, load_from_env
+from .relay import FRAME_REQUEST, HermesRelay
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ def make_adapter_class():
             self._client: VylenGatewayClient | None = None
             self._task: asyncio.Task | None = None
             self._instance_id: str | None = None
+            self._relay: HermesRelay | None = None
 
         async def connect(self) -> bool:
             try:
@@ -58,10 +60,11 @@ def make_adapter_class():
                 self._client = None
                 return False
             self._instance_id = ready.instance_id
+            self._relay = HermesRelay(self._client.send)
             self._task = asyncio.create_task(self._read_loop())
             logger.info(
-                "Vylen gateway online: instance_id=%s user_id=%s",
-                ready.instance_id, ready.user_id,
+                "Vylen gateway online: instance_id=%s user_id=%s hermes=%s",
+                ready.instance_id, ready.user_id, self._relay.hermes_url,
             )
             return True
 
@@ -73,6 +76,9 @@ def make_adapter_class():
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
                 self._task = None
+            if self._relay:
+                await self._relay.close()
+                self._relay = None
             if self._client:
                 await self._client.close()
                 self._client = None
@@ -89,8 +95,15 @@ def make_adapter_class():
 
         async def _read_loop(self) -> None:
             assert self._client is not None
+            assert self._relay is not None
+            relay = self._relay
+
+            async def on_frame(frame):
+                if frame.get("type") == FRAME_REQUEST:
+                    await relay.handle(frame)
+
             try:
-                await self._client.iter_frames()
+                await self._client.iter_frames(on_frame)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Vylen gateway read loop exited: %s", exc)
 
