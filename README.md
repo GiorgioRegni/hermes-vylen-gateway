@@ -60,3 +60,9 @@ pytest
 
 Tests stand up a tiny in-process `websockets` server as the mock cloud — no
 Hermes install needed.
+
+## How Hermes loads this plugin
+
+See [docs/hermes-internals.md](docs/hermes-internals.md). Entry-point
+contract, `plugins.enabled` gate, Docker quirks, and debugging recipes are
+all there. Read it once before touching the adapter or the entry point.
