@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-vylen-gateway"
+version = "0.1.0"
+description = "Vylen Cloud gateway adapter for hermes-agent — connects a local Hermes to Vylen mobile/web over a WebSocket tunnel."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "Vylen" }]
+dependencies = [
+    "websockets>=12,<14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+# Hermes discovers gateway/platform plugins via this entry-point group. When
+# the user does `pip install hermes-vylen-gateway` alongside hermes-agent and
+# then runs `hermes gateway`, the loader imports our module and calls
+# register(ctx). See hermes_cli/plugins.py ENTRY_POINTS_GROUP.
+[project.entry-points."hermes_agent.plugins"]
+vylen = "hermes_vylen_gateway:register"
+
+[project.scripts]
+vylen-gateway-doctor = "hermes_vylen_gateway.doctor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
