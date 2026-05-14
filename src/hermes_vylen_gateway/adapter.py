@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Any
 
 from .client import HandshakeError, VylenGatewayClient
@@ -20,6 +21,32 @@ from .relay import FRAME_REQUEST, HermesRelay
 from .transcribe import FRAME_TRANSCRIBE, Transcriber
 
 logger = logging.getLogger(__name__)
+
+# Cron output reaches `BasePlatformAdapter.send()` wrapped in this envelope
+# (built by `cron/scheduler.py` around line 503; controlled by the
+# `cron.wrap_response` config key, on by default). We strip it before
+# forwarding to the Vylen UI and extract the structured `job_id`/`name`
+# so the reply path can label and attribute pushes.
+#
+# Shape (job_id + name are required; the "To stop" footer is best-effort):
+#   Cronjob Response: <name>
+#   (job_id: <id>)
+#   -------------
+#
+#   <actual content>
+#
+#   To stop or manage this job, send me a new message ...
+#
+# Tracked as backlog: ask upstream Hermes to pass these as `metadata`
+# instead of regex-parsing. See vylen/docs/invariants.md.
+_CRON_ENVELOPE_RE = re.compile(
+    r"\ACronjob Response:\s*(?P<name>.*?)\n"
+    r"\(job_id:\s*(?P<job_id>[^\)]+)\)\n"
+    r"-+\n+"
+    r"(?P<body>.*?)"
+    r"(?:\n+To stop or manage this job[^\n]*)?\Z",
+    re.DOTALL,
+)
 
 
 def _import_hermes():
@@ -167,13 +194,19 @@ def make_adapter_class():
                     error="vylen gateway: socket not connected",
                     retryable=True,
                 )
-            text = content if isinstance(content, str) else str(content)
+            raw = content if isinstance(content, str) else str(content)
+            body, cron_job_id, cron_job_name = _parse_cron_envelope(raw)
+            frame: dict[str, Any] = {
+                "type": "push",
+                "chat_id": str(chat_id) if chat_id is not None else "",
+                "text": body,
+            }
+            if cron_job_id:
+                frame["cron_job_id"] = cron_job_id
+            if cron_job_name:
+                frame["cron_job_name"] = cron_job_name
             try:
-                await self._client.send({
-                    "type": "push",
-                    "chat_id": str(chat_id) if chat_id is not None else "",
-                    "text": text,
-                })
+                await self._client.send(frame)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("vylen gateway: push frame send failed: %s", exc)
                 return SendResult(success=False, error=str(exc), retryable=True)
@@ -183,6 +216,20 @@ def make_adapter_class():
             return {"name": "vylen", "type": "dm"}
 
     return VylenGatewayAdapter
+
+
+def _parse_cron_envelope(text: str) -> tuple[str, str, str]:
+    """Strip Hermes's cron-response chrome from `text` and extract job_id +
+    job_name. Returns `(body, job_id, job_name)`. If the envelope doesn't
+    match (chat message, ad-hoc send, or upstream changed the format),
+    returns the raw text and empty strings for the IDs — preserving the
+    pre-cron behavior so chat sends still work.
+    """
+    match = _CRON_ENVELOPE_RE.match(text)
+    if not match:
+        return text, "", ""
+    body = match.group("body").strip()
+    return body, match.group("job_id").strip(), match.group("name").strip()
 
 
 def adapter_factory(config):
