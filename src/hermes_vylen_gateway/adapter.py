@@ -153,11 +153,31 @@ def make_adapter_class():
                 self._client = None
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
-            # Checkpoint 4 fills this in. For now, signal "not yet wired" so
-            # any caller during the handshake-only phase gets a clean error
-            # rather than silent success.
+            # Plugin-initiated message — typically a Hermes cron with
+            # `deliver=vylen`, or `BasePlatformAdapter.send_image` etc.
+            # falling back to `.send`. We emit a `push` frame; the cloud
+            # fans out to any SSE subscribers on /v1/notifications for the
+            # owning user. No retries, no persistence — foreground pilot
+            # only. Background delivery (FCM) ships behind the Firebase
+            # Auth follow-up.
             from gateway.platforms.base import SendResult
-            return SendResult(success=False, error="vylen gateway: send() not implemented until checkpoint 4")
+            if self._client is None:
+                return SendResult(
+                    success=False,
+                    error="vylen gateway: socket not connected",
+                    retryable=True,
+                )
+            text = content if isinstance(content, str) else str(content)
+            try:
+                await self._client.send({
+                    "type": "push",
+                    "chat_id": str(chat_id) if chat_id is not None else "",
+                    "text": text,
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("vylen gateway: push frame send failed: %s", exc)
+                return SendResult(success=False, error=str(exc), retryable=True)
+            return SendResult(success=True)
 
         async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
             return {"name": "vylen", "type": "dm"}
