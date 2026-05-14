@@ -104,7 +104,32 @@ For audio specifically, Hermes's gateway runner auto-transcribes `event.media_ur
 
 `cron/scheduler.py` keeps an in-process weakref to each registered adapter and calls `adapter.send(chat_id, content)` when a scheduled job fires. The adapter's `send()` is the only path that needs to know how to deliver to its platform. There's no separate "push" API — same `send`.
 
-For Vylen this means: when checkpoint 6 implements `send()` properly, cron output should "just work" by emitting a frame the cloud forwards to mobile/web. No extra plumbing.
+### The resolver-gate that bit us second
+
+Before `adapter.send` is called, `cron/scheduler.py:_resolve_single_delivery_target` (around line 258) decides *if* the platform is a valid `deliver=<name>` target. For plugin platforms it requires **both**:
+
+1. `PlatformEntry.cron_deliver_env_var` is a non-empty string (passed to `ctx.register_platform(..., cron_deliver_env_var="VYLEN_HOME_CHAT_ID")`).
+2. The named env var holds a non-empty value at resolution time. The resolver passes that value through as the `chat_id` argument of the eventual `adapter.send(chat_id, content)` call — it's the "home channel id" for platforms like IRC where it actually matters.
+
+When either is missing the resolver returns `None` silently and the scheduler logs `WARNING cron.scheduler: Job '<id>': no delivery target resolved for deliver=vylen`. The job ticks every minute and drops its output every minute — no exception, no retry, nothing on the cloud side.
+
+For Vylen, the chat_id has no real meaning (the cloud fans out by `user_id`, not `chat_id`), so the plugin defaults `VYLEN_HOME_CHAT_ID=inbox` in `register()` via `os.environ.setdefault`. That makes `--deliver vylen` work out of the box; users can override the env var if a future revision splits the inbox into multiple buckets.
+
+### Cron payload chrome
+
+Hermes wraps cron output in an envelope before invoking `send`:
+
+```
+Cronjob Response: <job-name>
+(job_id: <id>)
+-------------
+
+<actual content>
+
+To stop or manage this job, send me a new message (e.g. "stop reminder <job-name>").
+```
+
+Useful on chat platforms where the user issued the cron interactively; verbose for Vylen's inbox. We currently render it as-is; a future revision can strip the envelope in `VylenGatewayAdapter.send()` if the verbosity grates.
 
 ---
 
