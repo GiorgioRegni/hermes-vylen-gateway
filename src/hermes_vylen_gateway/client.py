@@ -83,7 +83,15 @@ class VylenGatewayClient:
                 ws_connect(
                     self._config.websocket_url,
                     additional_headers=headers,
-                    max_size=8 * 1024 * 1024,
+                    # Cloud accepts Hermes / transcribe bodies up to 10MB
+                    # and forwards them base64-encoded inside a single
+                    # `request` / `transcribe` frame. Base64 expansion is
+                    # 4/3, plus JSON envelope overhead — round to 16MB so
+                    # legitimate large image/audio payloads aren't rejected
+                    # at the WS layer with "message too big". Keep in sync
+                    # with the cloud's body cap in
+                    # cloud/internal/cloud/server.go.
+                    max_size=16 * 1024 * 1024,
                 ),
                 timeout=timeout,
             )

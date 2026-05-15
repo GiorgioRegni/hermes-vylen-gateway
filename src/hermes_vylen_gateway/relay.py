@@ -29,6 +29,22 @@ FRAME_RESPONSE_ERROR = "response_error"
 DEFAULT_HERMES_URL = "http://127.0.0.1:8000"
 
 
+def _resolve_request_timeout() -> float | None:
+    """Read `VYLEN_HERMES_TIMEOUT` (seconds). Empty/unset → 5 minutes;
+    "none" disables the bound (diagnostic use only). Used by HermesRelay
+    so a hung local Hermes can't accumulate stuck background tasks."""
+    raw = (os.environ.get("VYLEN_HERMES_TIMEOUT") or "").strip().lower()
+    if raw == "none":
+        return None
+    if not raw:
+        return 300.0
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("VYLEN_HERMES_TIMEOUT=%r is not a number; using default", raw)
+        return 300.0
+
+
 class HermesRelay:
     """Routes a single inbound `request` frame to local Hermes and streams the
     response back. Each request runs in its own asyncio task; the relay is
@@ -40,11 +56,30 @@ class HermesRelay:
         send_frame: Callable[[dict[str, Any]], Awaitable[None]],
         hermes_url: str | None = None,
         hermes_api_key: str | None = None,
+        request_timeout: float | None = None,
     ):
         self._send = send_frame
         self._hermes_url = (hermes_url or os.environ.get("VYLEN_HERMES_URL", DEFAULT_HERMES_URL)).rstrip("/")
         self._hermes_api_key = (hermes_api_key or os.environ.get("VYLEN_HERMES_API_KEY", "")).strip()
-        self._client = httpx.AsyncClient(timeout=None)
+        # Bound the local Hermes call lifetime so a hung backend (socket
+        # accepted but no response bytes, model server stalled, etc.)
+        # can't accumulate background tasks indefinitely — cloud-side
+        # timeouts only stop *waiting* for the response, they don't
+        # cancel plugin work. The default (5 minutes total per request,
+        # 30s to receive the first byte) is generous enough for the
+        # longest tool-using LLM runs but finite. Override per-test via
+        # the constructor arg or globally via `VYLEN_HERMES_TIMEOUT`
+        # (seconds; "none" disables the bound — only for diagnostics).
+        if request_timeout is None:
+            request_timeout = _resolve_request_timeout()
+        if request_timeout is None:
+            timeout: httpx.Timeout | None = None
+        else:
+            # Generous read window so streaming /v1/responses runs can
+            # span minutes between SSE chunks; tight connect/pool/write so
+            # network-level stalls fail fast.
+            timeout = httpx.Timeout(request_timeout, connect=30.0, pool=10.0, write=30.0)
+        self._client = httpx.AsyncClient(timeout=timeout)
         self._tasks: set[asyncio.Task] = set()
 
     @property
