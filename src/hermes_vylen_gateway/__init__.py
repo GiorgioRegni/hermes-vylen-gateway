@@ -7,6 +7,7 @@ context object that exposes `register_platform(...)`.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from .adapter import adapter_factory, check_dependencies
@@ -26,6 +27,17 @@ __all__ = [
 
 def register(ctx) -> None:
     """Called by Hermes's plugin loader on `hermes gateway` startup."""
+    # Surface the supervisor's lifecycle events (gateway online, socket
+    # dropped, reconnect-in-Ns) in the Hermes container log. Hermes
+    # configures the root logger but third-party loggers default to
+    # WARNING — without this explicit override our INFO logs are
+    # filtered out, which made past "is the WS alive?" debugging mean
+    # tailing for absence-of-evidence rather than positive proof.
+    #
+    # Override the verbosity via VYLEN_LOG_LEVEL=DEBUG|INFO|WARNING|...
+    # if the default chatter is too much (it's low-volume; every 15s
+    # health probe is at DEBUG, only reconnects and drops are INFO).
+    _configure_plugin_logger()
     # Hermes's cron resolver gates `deliver=<platform>` on (a) the platform
     # declaring a `cron_deliver_env_var` and (b) that env var holding a
     # non-empty "home chat id" at resolution time. The chat_id is just a
@@ -48,3 +60,40 @@ def register(ctx) -> None:
         emoji="🚀",
         cron_deliver_env_var="VYLEN_HOME_CHAT_ID",
     )
+
+
+_LOG_HANDLER_TAG = "_vylen_plugin_handler"
+
+
+def _configure_plugin_logger() -> None:
+    """Apply VYLEN_LOG_LEVEL (default INFO) to the plugin's package
+    logger and attach a dedicated stderr handler so our INFO records
+    aren't filtered out by Hermes's root logger (which is configured at
+    WARNING by gateway.run). Idempotent — safe to call from every
+    process that re-imports the plugin (CLI, gateway, cron scheduler).
+    """
+    raw = (os.environ.get("VYLEN_LOG_LEVEL") or "INFO").strip().upper()
+    level = getattr(logging, raw, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+    package_logger = logging.getLogger("hermes_vylen_gateway")
+    package_logger.setLevel(level)
+    # Stop the record from also being handed to the root logger, which
+    # otherwise applies its own (typically WARNING) filter and swallows
+    # our INFO output. We own the handler below; root's handler doesn't
+    # get a second chance.
+    package_logger.propagate = False
+    # Attach our handler once per process. Tag it so a re-import doesn't
+    # stack duplicates if Hermes calls `discover_plugins()` more than
+    # once in the same interpreter.
+    for existing in package_logger.handlers:
+        if getattr(existing, _LOG_HANDLER_TAG, False):
+            existing.setLevel(level)
+            return
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    setattr(handler, _LOG_HANDLER_TAG, True)
+    package_logger.addHandler(handler)
