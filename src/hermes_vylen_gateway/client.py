@@ -93,6 +93,8 @@ class VylenGatewayClient:
             raise HandshakeError(
                 f"cloud rejected the connection: HTTP {exc.response.status_code}"
             ) from exc
+        except OSError as exc:
+            raise HandshakeError(f"failed dialing {self._config.websocket_url}: {exc}") from exc
         self._conn = conn
 
         hello = {

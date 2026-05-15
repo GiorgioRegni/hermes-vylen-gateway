@@ -143,3 +143,11 @@ async def test_handshake_no_reply_times_out():
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_connect_refused_raises_handshake_error():
+    port = _free_port()
+    client = VylenGatewayClient(_config_for(port))
+    with pytest.raises(HandshakeError, match="failed dialing"):
+        await client.connect(timeout=0.5)
