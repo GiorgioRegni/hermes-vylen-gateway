@@ -10,6 +10,7 @@ from hermes_vylen_gateway.memory import (
     create_memory_snapshot,
     list_memory_snapshots,
     preview_memory_write,
+    read_memory_snapshot,
     restore_memory_snapshot,
     write_memory,
 )
@@ -187,6 +188,28 @@ def test_snapshot_list_and_manual_create_exclude_bodies(monkeypatch, tmp_path):
     assert listed["snapshots"][0]["id"] == created["snapshot"]["id"]
     assert listed["snapshots"][0]["available"] is True
     assert "Private memory body" not in str(listed)
+
+
+def test_read_snapshot_returns_entries_without_persisting_to_list(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    memories = tmp_path / "memories"
+    memories.mkdir()
+    (memories / "USER.md").write_text("Line one\ncontinues" + ENTRY_DELIMITER + "Second", encoding="utf-8")
+    before = build_memory_status(include_entries=True)["targets"]["user"]
+    created = create_memory_snapshot({
+        "target": "user",
+        "expected_revision_hash": before["revision_hash"],
+    })
+
+    read = read_memory_snapshot({
+        "target": "user",
+        "snapshot_id": created["snapshot"]["id"],
+    })
+    listed = list_memory_snapshots({"target": "user"})
+
+    assert [entry["content"] for entry in read["entries"]] == ["Line one\ncontinues", "Second"]
+    assert read["content"] == "Line one\ncontinues" + ENTRY_DELIMITER + "Second"
+    assert "Line one" not in str(listed)
 
 
 def test_restore_snapshot_writes_body_and_creates_rollback(monkeypatch, tmp_path):

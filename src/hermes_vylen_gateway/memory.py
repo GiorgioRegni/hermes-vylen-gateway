@@ -111,6 +111,8 @@ class MemoryRPC:
                 result = list_memory_snapshots(_parse_params(frame))
             elif rpc == "memory.snapshots.create":
                 result = create_memory_snapshot(_parse_params(frame))
+            elif rpc == "memory.snapshots.read":
+                result = read_memory_snapshot(_parse_params(frame))
             elif rpc == "memory.snapshots.restore":
                 result = restore_memory_snapshot(_parse_params(frame))
             elif rpc == "memory.providers.status":
@@ -265,6 +267,31 @@ def create_memory_snapshot(params: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "snapshot": _snapshot_metadata_by_id(target, snapshot_id),
+        "session_warning": SESSION_WARNING,
+    }
+
+
+def read_memory_snapshot(params: dict[str, Any]) -> dict[str, Any]:
+    snapshot_id = str(params.get("snapshot_id") or "").strip()
+    if not _valid_snapshot_id(snapshot_id):
+        raise MemoryRPCError("MEMORY_BAD_SNAPSHOT", "snapshot_id is invalid.")
+    target = str(params.get("target") or "").strip()
+    if target:
+        if target not in TARGETS:
+            raise MemoryRPCError("MEMORY_BAD_TARGET", "target must be 'memory' or 'user'.")
+        snapshot = _snapshot_metadata_by_id(target, snapshot_id)
+    else:
+        snapshot = _find_snapshot_metadata(snapshot_id)
+        target = str(snapshot["target"])
+    body = _read_snapshot_body(target, snapshot_id)
+    entries = _parse_entries(body)
+    return {
+        "snapshot": snapshot,
+        "content": body,
+        "entries": [
+            {"index": i, "content": entry, "char_count": len(entry)}
+            for i, entry in enumerate(entries)
+        ],
         "session_warning": SESSION_WARNING,
     }
 
@@ -690,6 +717,16 @@ def _snapshot_metadata_by_id(target: str, snapshot_id: str) -> dict[str, Any]:
     if not metadata["available"]:
         raise MemoryRPCError("MEMORY_SNAPSHOT_NOT_FOUND", "Snapshot body was not found.")
     return metadata
+
+
+def _find_snapshot_metadata(snapshot_id: str) -> dict[str, Any]:
+    for target in TARGETS:
+        try:
+            return _snapshot_metadata_by_id(target, snapshot_id)
+        except MemoryRPCError as exc:
+            if exc.code != "MEMORY_SNAPSHOT_NOT_FOUND":
+                raise
+    raise MemoryRPCError("MEMORY_SNAPSHOT_NOT_FOUND", "Snapshot was not found.")
 
 
 def _read_snapshot_metadata(path: Path) -> dict[str, Any] | None:
