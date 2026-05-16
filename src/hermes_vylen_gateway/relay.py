@@ -246,16 +246,22 @@ class HermesRelay:
         self, request_id: str, response_id: str, after_cursor: int
     ) -> None:
         if self._response_buffers is None or not response_id:
+            logger.info("resume miss (no registry or empty id): %s", response_id)
             await self._send_error(
                 request_id, "RESUME_UNKNOWN", "no buffer for this response"
             )
             return
         buf = self._response_buffers.get(response_id)
         if buf is None:
+            logger.info("resume miss: response_id=%s", response_id)
             await self._send_error(
                 request_id, "RESUME_UNKNOWN", f"no buffer for response_id={response_id}"
             )
             return
+        logger.info(
+            "resume hit: response_id=%s after_cursor=%d complete=%s buffered=%d",
+            response_id, after_cursor, buf.complete, buf.cursor,
+        )
         await self._send({
             "type": FRAME_RESPONSE_HEADERS,
             "request_id": request_id,
