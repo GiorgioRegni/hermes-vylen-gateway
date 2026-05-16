@@ -119,6 +119,8 @@ class MemoryRPC:
                 result = list_memory_proposals(_parse_params(frame))
             elif rpc == "memory.proposals.create":
                 result = create_memory_proposal(_parse_params(frame))
+            elif rpc == "memory.proposals.update":
+                result = update_memory_proposal(_parse_params(frame))
             elif rpc == "memory.proposals.preview":
                 result = preview_memory_proposal(_parse_params(frame))
             elif rpc == "memory.proposals.apply":
@@ -412,6 +414,34 @@ def create_memory_proposal(params: dict[str, Any]) -> dict[str, Any]:
         "content_hash": _hash_text(content),
         "char_count": len(content),
     }
+    _write_proposal(proposal)
+    return {
+        "proposal": _proposal_metadata(proposal),
+        "session_warning": SESSION_WARNING,
+    }
+
+
+def update_memory_proposal(params: dict[str, Any]) -> dict[str, Any]:
+    proposal = _proposal_by_id(str(params.get("proposal_id") or ""))
+    _require_pending_proposal(proposal)
+    content = _draft_memory_entry(str(params.get("proposed_content") or ""))
+    if not content:
+        raise MemoryRPCError("MEMORY_BAD_PROPOSAL", "proposed_content is required.")
+    target = str(proposal["target"])
+
+    cfg, _config_available = _load_memory_config()
+    current_entries = _parse_entries(_read_target_text(_path_for_target(target)))
+    _validate_entries(target, [*current_entries, content], cfg)
+
+    proposal["ops"] = [{"type": "add", "content": content}]
+    proposal["operation_type"] = "add"
+    proposal["content"] = content
+    proposal["content_hash"] = _hash_text(content)
+    proposal["char_count"] = len(content)
+    proposal["updated_at"] = _now_iso()
+    reason = str(params.get("reason") or "").strip()
+    if reason:
+        proposal["reason"] = reason
     _write_proposal(proposal)
     return {
         "proposal": _proposal_metadata(proposal),

@@ -17,6 +17,7 @@ from hermes_vylen_gateway.memory import (
     preview_memory_write,
     read_memory_snapshot,
     restore_memory_snapshot,
+    update_memory_proposal,
     write_memory,
 )
 
@@ -308,3 +309,20 @@ def test_memory_proposal_reject_and_non_pending_apply(monkeypatch, tmp_path):
     with pytest.raises(MemoryRPCError) as exc:
         apply_memory_proposal({"proposal_id": created["proposal"]["id"]})
     assert exc.value.code == "MEMORY_PROPOSAL_NOT_PENDING"
+
+
+def test_memory_proposal_update_revalidates_pending_content(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    created = create_memory_proposal({"target": "memory", "source_text": "initial rough sentence"})
+
+    updated = update_memory_proposal({
+        "proposal_id": created["proposal"]["id"],
+        "proposed_content": "Remember this: Prefer concise durable memory entries.",
+        "reason": "edited before approval",
+    })
+    preview = preview_memory_proposal({"proposal_id": created["proposal"]["id"]})
+
+    assert updated["proposal"]["content"] == "Prefer concise durable memory entries."
+    assert updated["proposal"]["reason"] == "edited before approval"
+    assert preview["proposal"]["content"] == "Prefer concise durable memory entries."
+    assert preview["preview"]["entry_diff"]["added"] == 1
