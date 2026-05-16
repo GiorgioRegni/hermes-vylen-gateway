@@ -12,8 +12,9 @@ import asyncio
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Optional
 
+from .blobs import BlobRegistry
 from .client import HandshakeError, VylenGatewayClient
 from .config import ConfigError, load_from_env
 from .health import HealthReporter
@@ -80,6 +81,11 @@ def make_adapter_class():
             self._health: HealthReporter | None = None
             self._transcribe: Transcriber | None = None
             self._memory: MemoryRPC | None = None
+            # One blob registry per adapter lifetime; entries auto-expire
+            # (see blobs.py). Resets implicitly across reconnects since the
+            # adapter is reconstructed and the cloud only references tokens
+            # from the current session anyway.
+            self._blobs: BlobRegistry | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
@@ -156,7 +162,8 @@ def make_adapter_class():
                 return False
             self._client = client
             self._instance_id = ready.instance_id
-            self._relay = HermesRelay(client.send)
+            self._blobs = BlobRegistry()
+            self._relay = HermesRelay(client.send, blobs=self._blobs)
             self._health = HealthReporter(
                 client.send,
                 hermes_url=self._relay.hermes_url,
@@ -184,6 +191,10 @@ def make_adapter_class():
             if self._relay:
                 await self._relay.close()
                 self._relay = None
+            # BlobRegistry holds no OS resources (just an in-memory map);
+            # drop the reference so any outstanding tokens immediately
+            # become unaddressable across reconnects.
+            self._blobs = None
             if self._client:
                 await self._client.close()
                 self._client = None
@@ -218,6 +229,65 @@ def make_adapter_class():
                 await self._client.send(frame)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("vylen gateway: push frame send failed: %s", exc)
+                return SendResult(success=False, error=str(exc), retryable=True)
+            return SendResult(success=True)
+
+        async def send_image_file(
+            self,
+            chat_id: str,
+            image_path: str,
+            caption: Optional[str] = None,
+            reply_to: Optional[str] = None,
+            metadata: Optional[dict[str, Any]] = None,
+            **kwargs,
+        ):
+            # Tunnel-streamed media: register the local file in the
+            # BlobRegistry, get a short-lived token, ship just that on the
+            # push frame. The client fetches the bytes via
+            # /v1/instances/<id>/blobs/<token> on the cloud, which tunnels
+            # the read through the existing gateway WS (see relay._serve_blob).
+            # Push frames stay small; the SSE channel doesn't carry image
+            # bytes; multiple clients reuse the same URL.
+            from gateway.platforms.base import SendResult
+            if self._client is None or self._blobs is None:
+                return SendResult(
+                    success=False,
+                    error="vylen gateway: socket not connected",
+                    retryable=True,
+                )
+            registered = await self._blobs.register(image_path)
+            if registered is None:
+                logger.warning("vylen gateway: could not register image %s", image_path)
+                # Fall back to the base class behaviour (path-as-text) so the
+                # user at least sees that an image was attempted, rather than
+                # silent dropping.
+                return await super(VylenGatewayAdapter, self).send_image_file(
+                    chat_id=chat_id,
+                    image_path=image_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                    **kwargs,
+                )
+            token, mime, filename = registered
+            raw_caption = caption or ""
+            body, cron_job_id, cron_job_name = _parse_cron_envelope(raw_caption)
+            frame: dict[str, Any] = {
+                "type": "push",
+                "chat_id": str(chat_id) if chat_id is not None else "",
+                "text": body,
+                "image_token": token,
+                "image_mime": mime,
+                "image_filename": filename,
+            }
+            if cron_job_id:
+                frame["cron_job_id"] = cron_job_id
+            if cron_job_name:
+                frame["cron_job_name"] = cron_job_name
+            try:
+                await self._client.send(frame)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("vylen gateway: image push frame send failed: %s", exc)
                 return SendResult(success=False, error=str(exc), retryable=True)
             return SendResult(success=True)
 

@@ -13,11 +13,19 @@ import base64
 import json
 import logging
 import os
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
+from .blobs import BLOB_PATH_PREFIX, BlobRegistry
+
 logger = logging.getLogger(__name__)
+
+# Streamed-blob read chunk size. Picked to match a reasonable WebSocket
+# message budget (a too-big chunk inflates the websocket buffer; a too-small
+# chunk fragments the file across many frames and slows transfer). 256 KiB
+# is a comfortable middle for typical Hermes-generated images.
+_BLOB_CHUNK_BYTES = 256 * 1024
 
 # Frame type constants — keep in sync with cloud/internal/cloud/gateway.go.
 FRAME_REQUEST = "request"
@@ -57,10 +65,15 @@ class HermesRelay:
         hermes_url: str | None = None,
         hermes_api_key: str | None = None,
         request_timeout: float | None = None,
+        blobs: Optional[BlobRegistry] = None,
     ):
         self._send = send_frame
         self._hermes_url = (hermes_url or os.environ.get("VYLEN_HERMES_URL", DEFAULT_HERMES_URL)).rstrip("/")
         self._hermes_api_key = (hermes_api_key or os.environ.get("VYLEN_HERMES_API_KEY", "")).strip()
+        # Shared blob registry — populated by the adapter when Hermes
+        # produces an image; served by `_serve_blob` when the cloud tunnels
+        # a request to `/__vylen_blob__/<token>`.
+        self._blobs = blobs
         # Bound the local Hermes call lifetime so a hung backend (socket
         # accepted but no response bytes, model server stalled, etc.)
         # can't accumulate background tasks indefinitely — cloud-side
@@ -112,6 +125,14 @@ class HermesRelay:
         path = frame.get("path") or "/"
         body_b64 = frame.get("body") or ""
         headers = frame.get("headers") or {}
+        # Blob fetch short-circuit: tunnel requests against the magic
+        # `/__vylen_blob__/<token>` prefix are served from the adapter's
+        # BlobRegistry, not forwarded to Hermes. The cloud only routes
+        # requests with tokens we minted (see blobs.py), so this can't
+        # become an arbitrary-file-read primitive for the cloud.
+        if self._blobs is not None and path.startswith(BLOB_PATH_PREFIX):
+            await self._serve_blob(request_id, method, path)
+            return
         try:
             body = base64.b64decode(body_b64) if body_b64 else b""
         except Exception as exc:  # noqa: BLE001
@@ -156,6 +177,73 @@ class HermesRelay:
         except Exception as exc:  # noqa: BLE001
             logger.exception("relay crashed for %s %s", method, url)
             await self._send_error(request_id, "RELAY_ERROR", str(exc))
+
+    async def _serve_blob(self, request_id: str, method: str, path: str) -> None:
+        """Stream a registered blob back to the cloud using the standard
+        response_headers/response_chunk/response_end framing.
+
+        404 if the token is unknown / expired; 405 if the method isn't GET
+        or HEAD (HEAD returns headers only, useful for the client to
+        prefetch size/mime without downloading bytes)."""
+        if method.upper() not in ("GET", "HEAD"):
+            await self._send({
+                "type": FRAME_RESPONSE_HEADERS,
+                "request_id": request_id,
+                "status": 405,
+                "headers": {"Allow": "GET, HEAD"},
+            })
+            await self._send({"type": FRAME_RESPONSE_END, "request_id": request_id})
+            return
+        token = path[len(BLOB_PATH_PREFIX):]
+        assert self._blobs is not None  # narrow Optional for type checkers
+        entry = await self._blobs.lookup(token)
+        if entry is None:
+            await self._send({
+                "type": FRAME_RESPONSE_HEADERS,
+                "request_id": request_id,
+                "status": 404,
+                "headers": {"Content-Type": "text/plain; charset=utf-8"},
+            })
+            await self._send({"type": FRAME_RESPONSE_END, "request_id": request_id})
+            return
+        try:
+            size = entry.path.stat().st_size
+        except OSError as exc:
+            await self._send_error(request_id, "BLOB_GONE", str(exc))
+            return
+        response_headers = {
+            "Content-Type": entry.mime,
+            "Content-Length": str(size),
+            "Content-Disposition": f'inline; filename="{entry.filename}"',
+            # Browser/<img> caching is fine — blob URLs are content-keyed by
+            # token, which is per-image. Capped at the registry TTL so a
+            # client doesn't hold a stale entry beyond eviction.
+            "Cache-Control": "private, max-age=1800",
+        }
+        await self._send({
+            "type": FRAME_RESPONSE_HEADERS,
+            "request_id": request_id,
+            "status": 200,
+            "headers": response_headers,
+        })
+        if method.upper() == "HEAD":
+            await self._send({"type": FRAME_RESPONSE_END, "request_id": request_id})
+            return
+        try:
+            with entry.path.open("rb") as f:
+                while True:
+                    chunk = f.read(_BLOB_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    await self._send({
+                        "type": FRAME_RESPONSE_CHUNK,
+                        "request_id": request_id,
+                        "data": base64.b64encode(chunk).decode("ascii"),
+                    })
+        except OSError as exc:
+            await self._send_error(request_id, "BLOB_READ_FAILED", str(exc))
+            return
+        await self._send({"type": FRAME_RESPONSE_END, "request_id": request_id})
 
     async def _send_error(self, request_id: str, code: str, message: str) -> None:
         await self._send({
