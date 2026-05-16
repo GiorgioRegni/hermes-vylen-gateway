@@ -17,6 +17,7 @@ from typing import Any
 from .client import HandshakeError, VylenGatewayClient
 from .config import ConfigError, load_from_env
 from .health import HealthReporter
+from .memory import FRAME_MEMORY_REQUEST, MemoryRPC
 from .relay import FRAME_REQUEST, HermesRelay
 from .transcribe import FRAME_TRANSCRIBE, Transcriber
 
@@ -78,6 +79,7 @@ def make_adapter_class():
             self._relay: HermesRelay | None = None
             self._health: HealthReporter | None = None
             self._transcribe: Transcriber | None = None
+            self._memory: MemoryRPC | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
@@ -118,6 +120,7 @@ def make_adapter_class():
                 assert self._client is not None and self._relay is not None
                 relay = self._relay
                 transcriber = self._transcribe
+                memory = self._memory
 
                 async def on_frame(frame):
                     t = frame.get("type")
@@ -125,6 +128,8 @@ def make_adapter_class():
                         await relay.handle(frame)
                     elif t == FRAME_TRANSCRIBE and transcriber is not None:
                         await transcriber.handle(frame)
+                    elif t == FRAME_MEMORY_REQUEST and memory is not None:
+                        await memory.handle(frame)
 
                 try:
                     await self._client.iter_frames(on_frame)
@@ -159,6 +164,7 @@ def make_adapter_class():
             )
             self._health.start()
             self._transcribe = Transcriber(client.send)
+            self._memory = MemoryRPC(client.send)
             logger.info(
                 "Vylen gateway online: instance_id=%s user_id=%s hermes=%s",
                 ready.instance_id, ready.user_id, self._relay.hermes_url,
@@ -166,6 +172,9 @@ def make_adapter_class():
             return True
 
         async def _teardown_session(self) -> None:
+            if self._memory:
+                await self._memory.close()
+                self._memory = None
             if self._transcribe:
                 await self._transcribe.close()
                 self._transcribe = None
