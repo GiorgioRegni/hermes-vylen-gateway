@@ -6,9 +6,14 @@ from hermes_vylen_gateway.memory import (
     ENTRY_DELIMITER,
     _capacity_state,
     _target_status,
+    apply_memory_proposal,
     build_memory_status,
     create_memory_snapshot,
+    create_memory_proposal,
     list_memory_snapshots,
+    list_memory_proposals,
+    preview_memory_proposal,
+    reject_memory_proposal,
     preview_memory_write,
     read_memory_snapshot,
     restore_memory_snapshot,
@@ -262,3 +267,44 @@ def test_restore_snapshot_rejects_revision_conflict(monkeypatch, tmp_path):
         })
 
     assert exc.value.code == "MEMORY_REVISION_CONFLICT"
+
+
+def test_memory_proposal_lifecycle_is_plugin_local(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    created = create_memory_proposal({
+        "target": "memory",
+        "source_text": "Remember this: Prefer provider-agnostic designs.",
+        "source_type": "chat_message",
+        "source_message_id": "msg_1",
+        "reason": "test proposal",
+    })
+    proposal = created["proposal"]
+    listed = list_memory_proposals()
+    preview = preview_memory_proposal({"proposal_id": proposal["id"]})
+    applied = apply_memory_proposal({"proposal_id": proposal["id"]})
+
+    assert proposal["content"] == "Prefer provider-agnostic designs."
+    assert listed["proposals"][0]["id"] == proposal["id"]
+    assert preview["preview"]["entry_diff"]["added"] == 1
+    assert applied["proposal"]["status"] == "applied"
+    assert applied["write"]["snapshot_id"].startswith("snap_")
+    assert (tmp_path / "memories" / "MEMORY.md").read_text(encoding="utf-8") == "Prefer provider-agnostic designs."
+    assert list_memory_proposals()["proposals"] == []
+    assert list_memory_proposals({"status": "all"})["proposals"][0]["status"] == "applied"
+
+
+def test_memory_proposal_reject_and_non_pending_apply(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    created = create_memory_proposal({"target": "user", "source_text": "Likes concise summaries."})
+
+    rejected = reject_memory_proposal({"proposal_id": created["proposal"]["id"], "reason": "not durable"})
+
+    assert rejected["proposal"]["status"] == "rejected"
+    assert rejected["proposal"]["reject_reason"] == "not durable"
+
+    from hermes_vylen_gateway.memory import MemoryRPCError
+
+    with pytest.raises(MemoryRPCError) as exc:
+        apply_memory_proposal({"proposal_id": created["proposal"]["id"]})
+    assert exc.value.code == "MEMORY_PROPOSAL_NOT_PENDING"

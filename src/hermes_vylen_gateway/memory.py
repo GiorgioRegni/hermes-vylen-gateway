@@ -115,6 +115,16 @@ class MemoryRPC:
                 result = read_memory_snapshot(_parse_params(frame))
             elif rpc == "memory.snapshots.restore":
                 result = restore_memory_snapshot(_parse_params(frame))
+            elif rpc == "memory.proposals.list":
+                result = list_memory_proposals(_parse_params(frame))
+            elif rpc == "memory.proposals.create":
+                result = create_memory_proposal(_parse_params(frame))
+            elif rpc == "memory.proposals.preview":
+                result = preview_memory_proposal(_parse_params(frame))
+            elif rpc == "memory.proposals.apply":
+                result = apply_memory_proposal(_parse_params(frame))
+            elif rpc == "memory.proposals.reject":
+                result = reject_memory_proposal(_parse_params(frame))
             elif rpc == "memory.providers.status":
                 result = build_provider_status()
             else:
@@ -347,6 +357,125 @@ def restore_memory_snapshot(params: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+def list_memory_proposals(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    status_filter = str((params or {}).get("status") or "pending").strip()
+    if status_filter and status_filter not in {"pending", "applied", "rejected", "all"}:
+        raise MemoryRPCError("MEMORY_BAD_PROPOSAL", "status must be pending, applied, rejected, or all.")
+    proposals = []
+    proposal_dir = _proposal_dir()
+    if proposal_dir.exists():
+        for meta_path in proposal_dir.glob("*.json"):
+            proposal = _read_proposal_metadata(meta_path)
+            if proposal is None:
+                continue
+            if status_filter != "all" and proposal["status"] != status_filter:
+                continue
+            proposals.append(proposal)
+    proposals.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+    return {
+        "proposals": proposals,
+        "session_warning": SESSION_WARNING,
+    }
+
+
+def create_memory_proposal(params: dict[str, Any]) -> dict[str, Any]:
+    target = str(params.get("target") or "memory")
+    if target not in TARGETS:
+        raise MemoryRPCError("MEMORY_BAD_TARGET", "target must be 'memory' or 'user'.")
+    source_text = str(params.get("source_text") or "").strip()
+    proposed_content = str(params.get("proposed_content") or "").strip()
+    content = _draft_memory_entry(proposed_content or source_text)
+    if not content:
+        raise MemoryRPCError("MEMORY_BAD_PROPOSAL", "source_text or proposed_content is required.")
+    op = {"type": "add", "content": content}
+
+    cfg, _config_available = _load_memory_config()
+    current_entries = _parse_entries(_read_target_text(_path_for_target(target)))
+    _validate_entries(target, [*current_entries, content], cfg)
+
+    proposal_id = f"prop_{_compact_timestamp()}_{os.urandom(3).hex()}"
+    now = _now_iso()
+    proposal = {
+        "id": proposal_id,
+        "target": target,
+        "label": TARGETS[target]["label"],
+        "status": "pending",
+        "operation_type": "add",
+        "ops": [op],
+        "source_type": str(params.get("source_type") or "manual").strip() or "manual",
+        "source_message_id": str(params.get("source_message_id") or "").strip(),
+        "reason": str(params.get("reason") or "User requested durable memory").strip(),
+        "confidence": _bounded_confidence(params.get("confidence")),
+        "created_at": now,
+        "updated_at": now,
+        "content": content,
+        "content_hash": _hash_text(content),
+        "char_count": len(content),
+    }
+    _write_proposal(proposal)
+    return {
+        "proposal": _proposal_metadata(proposal),
+        "session_warning": SESSION_WARNING,
+    }
+
+
+def preview_memory_proposal(params: dict[str, Any]) -> dict[str, Any]:
+    proposal = _proposal_by_id(str(params.get("proposal_id") or ""))
+    _require_pending_proposal(proposal)
+    target = str(proposal["target"])
+    current_text = _read_target_text(_path_for_target(target))
+    return {
+        "proposal": _proposal_metadata(proposal),
+        "preview": preview_memory_write({
+            "target": target,
+            "expected_revision_hash": _hash_text(current_text),
+            "ops": proposal["ops"],
+            "reason": proposal.get("reason") or "Vylen memory proposal",
+        }),
+        "session_warning": SESSION_WARNING,
+    }
+
+
+def apply_memory_proposal(params: dict[str, Any]) -> dict[str, Any]:
+    proposal = _proposal_by_id(str(params.get("proposal_id") or ""))
+    _require_pending_proposal(proposal)
+    target = str(proposal["target"])
+    current_text = _read_target_text(_path_for_target(target))
+    result = write_memory({
+        "target": target,
+        "expected_revision_hash": _hash_text(current_text),
+        "ops": proposal["ops"],
+        "reason": proposal.get("reason") or "Vylen memory proposal",
+    })
+    proposal["status"] = "applied"
+    proposal["updated_at"] = _now_iso()
+    proposal["applied_at"] = proposal["updated_at"]
+    proposal["new_revision_hash"] = result.get("new_revision_hash") or ""
+    proposal["snapshot_id"] = result.get("snapshot_id") or ""
+    _write_proposal(proposal)
+    return {
+        "proposal": _proposal_metadata(proposal),
+        "write": result,
+        "session_warning": SESSION_WARNING,
+    }
+
+
+def reject_memory_proposal(params: dict[str, Any]) -> dict[str, Any]:
+    proposal = _proposal_by_id(str(params.get("proposal_id") or ""))
+    _require_pending_proposal(proposal)
+    proposal["status"] = "rejected"
+    proposal["updated_at"] = _now_iso()
+    proposal["rejected_at"] = proposal["updated_at"]
+    reject_reason = str(params.get("reason") or "").strip()
+    if reject_reason:
+        proposal["reject_reason"] = reject_reason
+    _write_proposal(proposal)
+    return {
+        "proposal": _proposal_metadata(proposal),
+        "session_warning": SESSION_WARNING,
+    }
+
+
 def build_provider_status() -> dict[str, Any]:
     cfg, config_available = _load_memory_config()
     provider = str(cfg.get("provider") or "").strip()
@@ -408,6 +537,22 @@ def _parse_write_request(params: dict[str, Any]) -> tuple[str, str, list[dict[st
         raise MemoryRPCError("MEMORY_BAD_REQUEST", "Every op must be an object.")
     reason = str(params.get("reason") or "").strip()
     return target, expected_hash, typed_ops, reason
+
+
+def _draft_memory_entry(text: str) -> str:
+    content = re.sub(r"\s+", " ", text.strip())
+    content = re.sub(r"(?i)\A(remember\s+(this|that)|please\s+remember|add\s+to\s+memory)\s*[:\-]\s*", "", content)
+    return content.strip()
+
+
+def _bounded_confidence(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, confidence))
 
 
 def _apply_ops(entries: list[str], ops: list[dict[str, Any]]) -> list[str]:
@@ -763,6 +908,101 @@ def _read_snapshot_body(target: str, snapshot_id: str) -> str:
         raise MemoryRPCError("MEMORY_INVALID_FILE", f"Snapshot is not valid UTF-8: {exc}") from exc
     except OSError as exc:
         raise MemoryRPCError("MEMORY_UNREADABLE", f"Could not read snapshot body: {exc}") from exc
+
+
+def _proposal_dir() -> Path:
+    return _memory_dir() / ".vylen-proposals"
+
+
+def _valid_proposal_id(proposal_id: str) -> bool:
+    return bool(re.fullmatch(r"prop_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{6}", proposal_id))
+
+
+def _proposal_by_id(proposal_id: str) -> dict[str, Any]:
+    if not _valid_proposal_id(proposal_id):
+        raise MemoryRPCError("MEMORY_BAD_PROPOSAL", "proposal_id is invalid.")
+    proposal = _read_proposal_metadata(_proposal_dir() / f"{proposal_id}.json")
+    if proposal is None:
+        raise MemoryRPCError("MEMORY_PROPOSAL_NOT_FOUND", "Memory proposal was not found.")
+    return proposal
+
+
+def _require_pending_proposal(proposal: dict[str, Any]) -> None:
+    if proposal.get("status") != "pending":
+        raise MemoryRPCError("MEMORY_PROPOSAL_NOT_PENDING", "Memory proposal is no longer pending.")
+
+
+def _write_proposal(proposal: dict[str, Any]) -> None:
+    proposal_dir = _proposal_dir()
+    proposal_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(proposal_dir / f"{proposal['id']}.json", json.dumps(proposal, indent=2, sort_keys=True))
+
+
+def _read_proposal_metadata(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.debug("memory proposal metadata unreadable: %s", path, exc_info=True)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    proposal_id = str(raw.get("id") or "")
+    target = str(raw.get("target") or "")
+    status = str(raw.get("status") or "")
+    if not _valid_proposal_id(proposal_id) or target not in TARGETS or status not in {"pending", "applied", "rejected"}:
+        return None
+    ops = raw.get("ops")
+    if not isinstance(ops, list) or not all(isinstance(op, dict) for op in ops):
+        return None
+    content = str(raw.get("content") or "")
+    return {
+        "id": proposal_id,
+        "target": target,
+        "label": str(raw.get("label") or TARGETS[target]["label"]),
+        "status": status,
+        "operation_type": str(raw.get("operation_type") or ""),
+        "ops": ops,
+        "source_type": str(raw.get("source_type") or ""),
+        "source_message_id": str(raw.get("source_message_id") or ""),
+        "reason": str(raw.get("reason") or ""),
+        "reject_reason": str(raw.get("reject_reason") or ""),
+        "confidence": raw.get("confidence") if isinstance(raw.get("confidence"), (int, float)) else None,
+        "created_at": str(raw.get("created_at") or ""),
+        "updated_at": str(raw.get("updated_at") or ""),
+        "applied_at": str(raw.get("applied_at") or ""),
+        "rejected_at": str(raw.get("rejected_at") or ""),
+        "new_revision_hash": str(raw.get("new_revision_hash") or ""),
+        "snapshot_id": str(raw.get("snapshot_id") or ""),
+        "content": content,
+        "content_hash": str(raw.get("content_hash") or _hash_text(content)),
+        "char_count": _int_config(raw.get("char_count"), len(content)),
+    }
+
+
+def _proposal_metadata(proposal: dict[str, Any]) -> dict[str, Any]:
+    target = str(proposal["target"])
+    return {
+        "id": proposal["id"],
+        "target": target,
+        "label": proposal.get("label") or TARGETS[target]["label"],
+        "status": proposal["status"],
+        "operation_type": proposal.get("operation_type") or "add",
+        "ops": proposal.get("ops") or [],
+        "source_type": proposal.get("source_type") or "",
+        "source_message_id": proposal.get("source_message_id") or "",
+        "reason": proposal.get("reason") or "",
+        "reject_reason": proposal.get("reject_reason") or "",
+        "confidence": proposal.get("confidence"),
+        "created_at": proposal.get("created_at") or "",
+        "updated_at": proposal.get("updated_at") or "",
+        "applied_at": proposal.get("applied_at") or "",
+        "rejected_at": proposal.get("rejected_at") or "",
+        "new_revision_hash": proposal.get("new_revision_hash") or "",
+        "snapshot_id": proposal.get("snapshot_id") or "",
+        "content": proposal.get("content") or "",
+        "content_hash": proposal.get("content_hash") or "",
+        "char_count": proposal.get("char_count") or 0,
+    }
 
 
 def _compact_timestamp() -> str:
