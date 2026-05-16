@@ -74,7 +74,11 @@ class BlobRegistry:
         adapter's send_image_file stays fast.
         """
         p = Path(path).expanduser()
-        if not p.is_file():
+        try:
+            stat = p.stat()
+        except OSError:
+            return None
+        if not p.is_file() or stat.st_size > DEFAULT_MAX_BYTES:
             return None
         mime, _ = mimetypes.guess_type(p.name)
         if mime is None:
