@@ -18,6 +18,11 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 
 from .blobs import BLOB_PATH_PREFIX, BlobRegistry
+from .response_buffer import (
+    ResponseBuffer,
+    ResponseBufferRegistry,
+    ResponseIdExtractor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +38,7 @@ FRAME_RESPONSE_HEADERS = "response_headers"
 FRAME_RESPONSE_CHUNK = "response_chunk"
 FRAME_RESPONSE_END = "response_end"
 FRAME_RESPONSE_ERROR = "response_error"
+FRAME_RESPONSE_RESUME = "response_resume"
 
 DEFAULT_HERMES_URL = "http://127.0.0.1:8000"
 
@@ -66,6 +72,7 @@ class HermesRelay:
         hermes_api_key: str | None = None,
         request_timeout: float | None = None,
         blobs: Optional[BlobRegistry] = None,
+        response_buffers: Optional[ResponseBufferRegistry] = None,
     ):
         self._send = send_frame
         self._hermes_url = (hermes_url or os.environ.get("VYLEN_HERMES_URL", DEFAULT_HERMES_URL)).rstrip("/")
@@ -74,6 +81,10 @@ class HermesRelay:
         # produces an image; served by `_serve_blob` when the cloud tunnels
         # a request to `/__vylen_blob__/<token>`.
         self._blobs = blobs
+        # Response buffer registry. Optional so callers that don't need
+        # resume (tests, blob-only mocks) can omit it; the adapter wires a
+        # real registry in production. See spec 003.
+        self._response_buffers = response_buffers
         # Bound the local Hermes call lifetime so a hung backend (socket
         # accepted but no response bytes, model server stalled, etc.)
         # can't accumulate background tasks indefinitely — cloud-side
@@ -147,15 +158,29 @@ class HermesRelay:
             # without the upstream client knowing about it.
             forwarded["Authorization"] = f"Bearer {self._hermes_api_key}"
         logger.debug("relay -> %s %s (request_id=%s)", method, url, request_id)
+        # Resume buffering state. We don't know the Hermes response_id until
+        # the `response.created` SSE event arrives, so we pre-buffer chunks
+        # in `preroll` and graduate to a real buffer once the id is found.
+        # If the id never arrives (non-SSE response, error, etc.) we just
+        # drop the preroll and the response is non-resumable.
+        extractor: Optional[ResponseIdExtractor] = (
+            ResponseIdExtractor() if self._response_buffers is not None else None
+        )
+        preroll: list[bytes] = []
+        buffer: Optional[ResponseBuffer] = None
+        seen_headers: dict[str, str] = {}
+        seen_status: int = 0
         try:
             async with self._client.stream(
                 method, url, content=body, headers=forwarded
             ) as resp:
+                seen_status = resp.status_code
+                seen_headers = _filter_response_headers(dict(resp.headers))
                 await self._send({
                     "type": FRAME_RESPONSE_HEADERS,
                     "request_id": request_id,
-                    "status": resp.status_code,
-                    "headers": _filter_response_headers(dict(resp.headers)),
+                    "status": seen_status,
+                    "headers": seen_headers,
                 })
                 async for chunk in resp.aiter_raw():
                     if not chunk:
@@ -165,16 +190,39 @@ class HermesRelay:
                         "request_id": request_id,
                         "data": base64.b64encode(chunk).decode("ascii"),
                     })
+                    if extractor is None:
+                        continue
+                    if buffer is not None:
+                        buffer.append(chunk)
+                        continue
+                    rid = extractor.feed(chunk)
+                    if rid is None:
+                        preroll.append(chunk)
+                        continue
+                    assert self._response_buffers is not None
+                    buffer = self._response_buffers.create(rid, seen_status, seen_headers)
+                    for prev in preroll:
+                        buffer.append(prev)
+                    preroll.clear()
+                    buffer.append(chunk)
+                if buffer is not None:
+                    buffer.finalize()
                 await self._send({
                     "type": FRAME_RESPONSE_END,
                     "request_id": request_id,
                 })
         except httpx.HTTPError as exc:
+            if buffer is not None and self._response_buffers is not None:
+                self._response_buffers.drop(buffer.response_id)
             logger.warning("relay error for %s %s: %s", method, url, exc)
             await self._send_error(request_id, "HERMES_UNREACHABLE", str(exc))
         except asyncio.CancelledError:
+            if buffer is not None and self._response_buffers is not None:
+                self._response_buffers.drop(buffer.response_id)
             raise
         except Exception as exc:  # noqa: BLE001
+            if buffer is not None and self._response_buffers is not None:
+                self._response_buffers.drop(buffer.response_id)
             logger.exception("relay crashed for %s %s", method, url)
             await self._send_error(request_id, "RELAY_ERROR", str(exc))
 

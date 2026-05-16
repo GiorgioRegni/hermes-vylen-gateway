@@ -24,6 +24,7 @@ from hermes_vylen_gateway.relay import (
     FRAME_RESPONSE_HEADERS,
     HermesRelay,
 )
+from hermes_vylen_gateway.response_buffer import ResponseBufferRegistry
 
 
 def _free_port() -> int:
@@ -141,3 +142,46 @@ async def test_relay_emits_response_error_when_hermes_unreachable():
     assert err["type"] == "response_error"
     assert err["request_id"] == "req_x"
     assert err["code"] == "HERMES_UNREACHABLE"
+
+
+@pytest.mark.asyncio
+async def test_relay_populates_response_buffer_for_resume():
+    hermes_port = _free_port()
+    runner = await _start_mock_hermes(hermes_port)
+    try:
+        sent_event = asyncio.Event()
+
+        async def send(frame):
+            if frame["type"] == FRAME_RESPONSE_END:
+                sent_event.set()
+
+        buffers = ResponseBufferRegistry(grace_seconds=300.0, max_bytes=1 << 20)
+        relay = HermesRelay(
+            send,
+            hermes_url=f"http://127.0.0.1:{hermes_port}",
+            response_buffers=buffers,
+        )
+        try:
+            await relay.handle({
+                "type": FRAME_REQUEST,
+                "request_id": "req_buf",
+                "method": "POST",
+                "path": "/v1/responses",
+                "headers": {"Content-Type": "application/json"},
+                "body": base64.b64encode(b'{"input":"hi","stream":true}').decode(),
+                "stream": True,
+            })
+            await asyncio.wait_for(sent_event.wait(), timeout=3.0)
+        finally:
+            await relay.close()
+    finally:
+        await runner.cleanup()
+
+    buf = buffers.get("resp_1")
+    assert buf is not None, "relay should have created a buffer keyed by response_id"
+    assert buf.complete is True
+    assert buf.status == 200
+    body = b"".join(buf.chunks)
+    assert b"event: response.created" in body
+    assert b"event: response.output_text.delta" in body
+    assert b"event: response.completed" in body
