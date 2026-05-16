@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -106,6 +107,12 @@ class MemoryRPC:
                 result = preview_memory_write(_parse_params(frame))
             elif rpc == "memory.core.write":
                 result = write_memory(_parse_params(frame))
+            elif rpc == "memory.snapshots.list":
+                result = list_memory_snapshots(_parse_params(frame))
+            elif rpc == "memory.snapshots.create":
+                result = create_memory_snapshot(_parse_params(frame))
+            elif rpc == "memory.snapshots.restore":
+                result = restore_memory_snapshot(_parse_params(frame))
             elif rpc == "memory.providers.status":
                 result = build_provider_status()
             else:
@@ -213,6 +220,106 @@ def write_memory(params: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+def list_memory_snapshots(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    target_filter = ""
+    if params:
+        raw_target = str(params.get("target") or "")
+        if raw_target:
+            if raw_target not in TARGETS:
+                raise MemoryRPCError("MEMORY_BAD_TARGET", "target must be 'memory' or 'user'.")
+            target_filter = raw_target
+
+    snapshots = []
+    targets = [target_filter] if target_filter else list(TARGETS)
+    for target in targets:
+        snapshot_dir = _snapshot_dir(target)
+        if not snapshot_dir.exists():
+            continue
+        for meta_path in snapshot_dir.glob("*.json"):
+            metadata = _read_snapshot_metadata(meta_path)
+            if metadata is None:
+                continue
+            body_path = snapshot_dir / f"{metadata['id']}.md"
+            metadata["available"] = body_path.exists()
+            snapshots.append(metadata)
+
+    snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return {
+        "snapshots": snapshots,
+        "session_warning": SESSION_WARNING,
+    }
+
+
+def create_memory_snapshot(params: dict[str, Any]) -> dict[str, Any]:
+    target = _parse_target(params)
+    expected_hash = str(params.get("expected_revision_hash") or "")
+    reason = str(params.get("reason") or "manual snapshot").strip()
+    path = _path_for_target(target)
+
+    with _file_lock(path):
+        text = _read_target_text(path)
+        revision_hash = _hash_text(text)
+        if expected_hash and expected_hash != revision_hash:
+            raise MemoryRPCError("MEMORY_REVISION_CONFLICT", "Memory changed since it was loaded.")
+        snapshot_id = _create_snapshot(target, path, text, revision_hash, reason)
+
+    return {
+        "snapshot": _snapshot_metadata_by_id(target, snapshot_id),
+        "session_warning": SESSION_WARNING,
+    }
+
+
+def restore_memory_snapshot(params: dict[str, Any]) -> dict[str, Any]:
+    target = _parse_target(params)
+    snapshot_id = str(params.get("snapshot_id") or "").strip()
+    if not _valid_snapshot_id(snapshot_id):
+        raise MemoryRPCError("MEMORY_BAD_SNAPSHOT", "snapshot_id is invalid.")
+    expected_hash = str(params.get("expected_revision_hash") or "")
+    reason = str(params.get("reason") or f"restore {snapshot_id}").strip()
+    cfg, config_available = _load_memory_config()
+    path = _path_for_target(target)
+    snapshot = _snapshot_metadata_by_id(target, snapshot_id)
+    if snapshot.get("target") != target:
+        raise MemoryRPCError("MEMORY_BAD_SNAPSHOT", "snapshot target does not match request target.")
+    snapshot_body = _read_snapshot_body(target, snapshot_id)
+    snapshot_entries = _parse_entries(snapshot_body)
+    _validate_entries(target, snapshot_entries, cfg)
+
+    with _file_lock(path):
+        before_raw = _read_target_text(path)
+        before_entries = _parse_entries(before_raw)
+        previous_hash = _hash_text(before_raw)
+        if expected_hash and expected_hash != previous_hash:
+            raise MemoryRPCError("MEMORY_REVISION_CONFLICT", "Memory changed since it was loaded.")
+        rollback_snapshot_id = _create_snapshot(
+            target,
+            path,
+            before_raw,
+            previous_hash,
+            f"rollback before restoring {snapshot_id}: {reason}",
+        )
+        _atomic_write_text(path, snapshot_body)
+        verified = _read_target_text(path)
+        new_hash = _hash_text(verified)
+        if new_hash != _hash_text(snapshot_body):
+            raise MemoryRPCError("MEMORY_WRITE_VERIFY_FAILED", "Memory restore verification failed.")
+
+    response = _preview_response(
+        target,
+        before_entries,
+        snapshot_entries,
+        previous_hash,
+        new_hash,
+        cfg,
+        config_available=config_available,
+    )
+    response["snapshot_id"] = snapshot_id
+    response["restored_snapshot"] = snapshot
+    response["rollback_snapshot_id"] = rollback_snapshot_id
+    response["session_warning"] = SESSION_WARNING
+    return response
+
+
 def build_provider_status() -> dict[str, Any]:
     cfg, config_available = _load_memory_config()
     provider = str(cfg.get("provider") or "").strip()
@@ -250,18 +357,21 @@ def _parse_params(frame: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
-        import json
-
         parsed = json.loads(raw) if raw else {}
         if isinstance(parsed, dict):
             return parsed
     return {}
 
 
-def _parse_write_request(params: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]], str]:
+def _parse_target(params: dict[str, Any]) -> str:
     target = str(params.get("target") or "")
     if target not in TARGETS:
         raise MemoryRPCError("MEMORY_BAD_TARGET", "target must be 'memory' or 'user'.")
+    return target
+
+
+def _parse_write_request(params: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]], str]:
+    target = _parse_target(params)
     expected_hash = str(params.get("expected_revision_hash") or "")
     ops = params.get("ops")
     if not isinstance(ops, list) or not ops:
@@ -537,17 +647,16 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _create_snapshot(target: str, path: Path, text: str, revision_hash: str, reason: str) -> str:
-    snapshot_dir = _memory_dir() / ".vylen-snapshots" / target
+    snapshot_dir = _snapshot_dir(target)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_id = f"snap_{_compact_timestamp()}_{revision_hash[:12]}"
+    snapshot_id = f"snap_{_compact_timestamp()}_{revision_hash[:8]}{os.urandom(2).hex()}"
     body_path = snapshot_dir / f"{snapshot_id}.md"
     meta_path = snapshot_dir / f"{snapshot_id}.json"
     _atomic_write_text(body_path, text)
-    import json
-
     metadata = {
         "id": snapshot_id,
         "target": target,
+        "label": TARGETS[target]["label"],
         "source_file": str(path),
         "revision_hash": revision_hash,
         "char_count": len(text),
@@ -557,6 +666,66 @@ def _create_snapshot(target: str, path: Path, text: str, revision_hash: str, rea
     }
     _atomic_write_text(meta_path, json.dumps(metadata, indent=2, sort_keys=True))
     return snapshot_id
+
+
+def _snapshot_dir(target: str) -> Path:
+    if target not in TARGETS:
+        raise MemoryRPCError("MEMORY_BAD_TARGET", "target must be 'memory' or 'user'.")
+    return _memory_dir() / ".vylen-snapshots" / target
+
+
+def _valid_snapshot_id(snapshot_id: str) -> bool:
+    return bool(re.fullmatch(r"snap_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{12}", snapshot_id))
+
+
+def _snapshot_metadata_by_id(target: str, snapshot_id: str) -> dict[str, Any]:
+    if not _valid_snapshot_id(snapshot_id):
+        raise MemoryRPCError("MEMORY_BAD_SNAPSHOT", "snapshot_id is invalid.")
+    meta_path = _snapshot_dir(target) / f"{snapshot_id}.json"
+    metadata = _read_snapshot_metadata(meta_path)
+    if metadata is None:
+        raise MemoryRPCError("MEMORY_SNAPSHOT_NOT_FOUND", "Snapshot was not found.")
+    body_path = _snapshot_dir(target) / f"{snapshot_id}.md"
+    metadata["available"] = body_path.exists()
+    if not metadata["available"]:
+        raise MemoryRPCError("MEMORY_SNAPSHOT_NOT_FOUND", "Snapshot body was not found.")
+    return metadata
+
+
+def _read_snapshot_metadata(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.debug("memory snapshot metadata unreadable: %s", path, exc_info=True)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    snapshot_id = str(raw.get("id") or "")
+    target = str(raw.get("target") or "")
+    if target not in TARGETS or not _valid_snapshot_id(snapshot_id):
+        return None
+    return {
+        "id": snapshot_id,
+        "target": target,
+        "label": str(raw.get("label") or TARGETS[target]["label"]),
+        "revision_hash": str(raw.get("revision_hash") or ""),
+        "char_count": _int_config(raw.get("char_count"), 0),
+        "entry_count": _int_config(raw.get("entry_count"), 0),
+        "reason": str(raw.get("reason") or ""),
+        "created_at": str(raw.get("created_at") or ""),
+    }
+
+
+def _read_snapshot_body(target: str, snapshot_id: str) -> str:
+    path = _snapshot_dir(target) / f"{snapshot_id}.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise MemoryRPCError("MEMORY_SNAPSHOT_NOT_FOUND", "Snapshot body was not found.") from exc
+    except UnicodeDecodeError as exc:
+        raise MemoryRPCError("MEMORY_INVALID_FILE", f"Snapshot is not valid UTF-8: {exc}") from exc
+    except OSError as exc:
+        raise MemoryRPCError("MEMORY_UNREADABLE", f"Could not read snapshot body: {exc}") from exc
 
 
 def _compact_timestamp() -> str:
