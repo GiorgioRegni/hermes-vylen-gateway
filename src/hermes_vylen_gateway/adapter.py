@@ -19,10 +19,33 @@ from .client import HandshakeError, VylenGatewayClient
 from .config import ConfigError, load_from_env
 from .health import HealthReporter
 from .memory import FRAME_MEMORY_REQUEST, MemoryRPC
-from .relay import FRAME_REQUEST, HermesRelay
+from .relay import FRAME_REQUEST, FRAME_RESPONSE_RESUME, HermesRelay
+from .response_buffer import ResponseBufferRegistry
 from .transcribe import FRAME_TRANSCRIBE, Transcriber
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using default %s", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using default %s", name, raw, default)
+        return default
 
 # Cron output reaches `BasePlatformAdapter.send()` wrapped in this envelope
 # (built by `cron/scheduler.py` around line 503; controlled by the
@@ -86,6 +109,7 @@ def make_adapter_class():
             # adapter is reconstructed and the cloud only references tokens
             # from the current session anyway.
             self._blobs: BlobRegistry | None = None
+            self._response_buffers: ResponseBufferRegistry | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
@@ -132,6 +156,8 @@ def make_adapter_class():
                     t = frame.get("type")
                     if t == FRAME_REQUEST:
                         await relay.handle(frame)
+                    elif t == FRAME_RESPONSE_RESUME:
+                        await relay.handle_resume(frame)
                     elif t == FRAME_TRANSCRIBE and transcriber is not None:
                         await transcriber.handle(frame)
                     elif t == FRAME_MEMORY_REQUEST and memory is not None:
@@ -163,7 +189,15 @@ def make_adapter_class():
             self._client = client
             self._instance_id = ready.instance_id
             self._blobs = BlobRegistry()
-            self._relay = HermesRelay(client.send, blobs=self._blobs)
+            self._response_buffers = ResponseBufferRegistry(
+                grace_seconds=_env_float("VYLEN_RESUME_GRACE_SECONDS", 300.0),
+                max_bytes=_env_int("VYLEN_RESUME_MAX_BYTES", 4 * 1024 * 1024),
+            )
+            self._relay = HermesRelay(
+                client.send,
+                blobs=self._blobs,
+                response_buffers=self._response_buffers,
+            )
             self._health = HealthReporter(
                 client.send,
                 hermes_url=self._relay.hermes_url,
@@ -195,6 +229,7 @@ def make_adapter_class():
             # drop the reference so any outstanding tokens immediately
             # become unaddressable across reconnects.
             self._blobs = None
+            self._response_buffers = None
             if self._client:
                 await self._client.close()
                 self._client = None

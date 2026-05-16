@@ -121,6 +121,25 @@ class HermesRelay:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    async def handle_resume(self, frame: dict[str, Any]) -> None:
+        """Schedule one resume. Looks up the buffer by response_id and
+        replays chunks past `after_cursor`, then tails live until the
+        buffer is complete. See docs/specs/003-resumable-responses.md."""
+        request_id = frame.get("request_id") or ""
+        if not request_id:
+            logger.warning("relay: response_resume frame missing request_id, dropping")
+            return
+        response_id = frame.get("response_id") or ""
+        try:
+            after_cursor = int(frame.get("after_cursor") or 0)
+        except (TypeError, ValueError):
+            after_cursor = 0
+        task = asyncio.create_task(
+            self._run_resume(request_id, response_id, after_cursor)
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     async def close(self) -> None:
         for task in list(self._tasks):
             task.cancel()
@@ -212,19 +231,65 @@ class HermesRelay:
                     "request_id": request_id,
                 })
         except httpx.HTTPError as exc:
-            if buffer is not None and self._response_buffers is not None:
-                self._response_buffers.drop(buffer.response_id)
+            _abandon_buffer(buffer, self._response_buffers)
             logger.warning("relay error for %s %s: %s", method, url, exc)
             await self._send_error(request_id, "HERMES_UNREACHABLE", str(exc))
         except asyncio.CancelledError:
-            if buffer is not None and self._response_buffers is not None:
-                self._response_buffers.drop(buffer.response_id)
+            _abandon_buffer(buffer, self._response_buffers)
             raise
         except Exception as exc:  # noqa: BLE001
-            if buffer is not None and self._response_buffers is not None:
-                self._response_buffers.drop(buffer.response_id)
+            _abandon_buffer(buffer, self._response_buffers)
             logger.exception("relay crashed for %s %s", method, url)
             await self._send_error(request_id, "RELAY_ERROR", str(exc))
+
+    async def _run_resume(
+        self, request_id: str, response_id: str, after_cursor: int
+    ) -> None:
+        if self._response_buffers is None or not response_id:
+            await self._send_error(
+                request_id, "RESUME_UNKNOWN", "no buffer for this response"
+            )
+            return
+        buf = self._response_buffers.get(response_id)
+        if buf is None:
+            await self._send_error(
+                request_id, "RESUME_UNKNOWN", f"no buffer for response_id={response_id}"
+            )
+            return
+        await self._send({
+            "type": FRAME_RESPONSE_HEADERS,
+            "request_id": request_id,
+            "status": buf.status,
+            "headers": dict(buf.headers),
+        })
+        cursor = max(0, after_cursor)
+        try:
+            while True:
+                pending = buf.chunks[cursor:]
+                for chunk in pending:
+                    await self._send({
+                        "type": FRAME_RESPONSE_CHUNK,
+                        "request_id": request_id,
+                        "data": base64.b64encode(chunk).decode("ascii"),
+                    })
+                cursor = buf.cursor
+                if buf.complete:
+                    await self._send({
+                        "type": FRAME_RESPONSE_END,
+                        "request_id": request_id,
+                    })
+                    return
+                # Wait for the writer to append more (or to finalize on
+                # error). The writer always set()s `progressed` after a
+                # change, so clearing here is safe — a missed set between
+                # drain and clear becomes a no-op next iteration when we
+                # re-check `chunks` before waiting again.
+                buf.progressed.clear()
+                if buf.cursor > cursor or buf.complete:
+                    continue
+                await buf.progressed.wait()
+        except asyncio.CancelledError:
+            raise
 
     async def _serve_blob(self, request_id: str, method: str, path: str) -> None:
         """Stream a registered blob back to the cloud using the standard
@@ -314,6 +379,21 @@ _DROP_REQUEST_HEADERS = {
     "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
     "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
 }
+
+
+def _abandon_buffer(
+    buffer: Optional[ResponseBuffer],
+    registry: Optional[ResponseBufferRegistry],
+) -> None:
+    """On relay error/cancellation, wake any pending resume readers so they
+    don't hang on `progressed.wait()`, then drop the entry from the
+    registry. The reader will see `complete=True` with no further chunks
+    and emit response_end — mobile shows a truncated reply and the user
+    falls back to asking Hermes to resend (which has the local log)."""
+    if buffer is None or registry is None:
+        return
+    buffer.finalize()
+    registry.drop(buffer.response_id)
 
 
 def _filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
