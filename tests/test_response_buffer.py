@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from hermes_vylen_gateway.adapter import _sweep_loop
 from hermes_vylen_gateway.response_buffer import (
     ResponseBuffer,
     ResponseBufferRegistry,
@@ -144,3 +145,32 @@ async def test_buffer_progressed_event_wakes_waiters():
     buf.append(b"payload")
     result = await asyncio.wait_for(task, timeout=1.0)
     assert result == b"payload"
+
+
+@pytest.mark.asyncio
+async def test_sweep_loop_evicts_expired_buffers():
+    reg = ResponseBufferRegistry(grace_seconds=0.05, max_bytes=1024)
+    buf = reg.create("r_swept", 200, {})
+    buf.append(b"data")
+    buf.finalize()
+    assert len(reg) == 1
+
+    task = asyncio.create_task(_sweep_loop(reg, interval_seconds=0.02))
+    # Give the loop enough wallclock to tick a few times past grace.
+    await asyncio.sleep(0.2)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert reg.get("r_swept") is None
+    assert len(reg) == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_loop_returns_immediately_when_disabled():
+    reg = ResponseBufferRegistry()
+    # interval <= 0 disables the loop; the task should finish cleanly
+    # without ever calling sweep.
+    await asyncio.wait_for(_sweep_loop(reg, interval_seconds=0.0), timeout=1.0)

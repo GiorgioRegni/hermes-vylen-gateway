@@ -37,6 +37,27 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+async def _sweep_loop(
+    registry: ResponseBufferRegistry, interval_seconds: float
+) -> None:
+    """Periodically drop completed/expired response buffers so a long-lived
+    gateway session doesn't accumulate state proportional to streamed
+    response volume. Cancelled on session teardown."""
+    if interval_seconds <= 0:
+        return
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            raise
+        try:
+            evicted = registry.sweep()
+            if evicted:
+                logger.debug("response buffer sweep: evicted=%d", evicted)
+        except Exception:  # noqa: BLE001
+            logger.exception("response buffer sweep failed")
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if not raw:
@@ -110,6 +131,7 @@ def make_adapter_class():
             # from the current session anyway.
             self._blobs: BlobRegistry | None = None
             self._response_buffers: ResponseBufferRegistry | None = None
+            self._sweep_task: asyncio.Task | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
@@ -193,6 +215,10 @@ def make_adapter_class():
                 grace_seconds=_env_float("VYLEN_RESUME_GRACE_SECONDS", 300.0),
                 max_bytes=_env_int("VYLEN_RESUME_MAX_BYTES", 4 * 1024 * 1024),
             )
+            sweep_interval = _env_float("VYLEN_RESUME_SWEEP_SECONDS", 60.0)
+            self._sweep_task = asyncio.create_task(
+                _sweep_loop(self._response_buffers, sweep_interval)
+            )
             self._relay = HermesRelay(
                 client.send,
                 blobs=self._blobs,
@@ -213,6 +239,13 @@ def make_adapter_class():
             return True
 
         async def _teardown_session(self) -> None:
+            if self._sweep_task:
+                self._sweep_task.cancel()
+                try:
+                    await self._sweep_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                self._sweep_task = None
             if self._memory:
                 await self._memory.close()
                 self._memory = None
