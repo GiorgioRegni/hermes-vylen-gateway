@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
-DEFAULT_CLOUD_URL = "https://cloud.vylen.ai"
+DEFAULT_CLOUD_URL = "https://relay.vylenagent.com"
 GATEWAY_PATH = "/v1/gateway"
 
 

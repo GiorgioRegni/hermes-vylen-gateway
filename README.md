@@ -17,17 +17,20 @@ in the Vylen monorepo.
 pip install hermes-vylen-gateway
 ```
 
-Set two env vars in `~/.hermes/.env` (or wherever you run Hermes from):
+Set the instance token in `~/.hermes/.env` (or wherever you run Hermes from):
 
 ```bash
 VYLEN_INSTANCE_TOKEN=vyl_live_…   # one-time, from the Vylen portal
-VYLEN_CLOUD_URL=https://cloud.vylen.ai   # optional; default shown
 ```
 
-For local dev against a Vylen Cloud running on your machine:
+The plugin defaults to the production relay at `https://relay.vylenagent.com`. Override only when pointing at something else:
 
 ```bash
+# Local dev against a Vylen Cloud running on your machine:
 VYLEN_CLOUD_URL=http://localhost:8420
+
+# Or from inside a Docker container where the host runs the cloud:
+VYLEN_CLOUD_URL=http://host.docker.internal:8420
 ```
 
 `http://` is accepted; the plugin selects `ws://` vs `wss://` automatically.
