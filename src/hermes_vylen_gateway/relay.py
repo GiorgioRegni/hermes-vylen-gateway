@@ -278,7 +278,16 @@ class HermesRelay:
                         "request_id": request_id,
                         "data": base64.b64encode(chunk).decode("ascii"),
                     })
-                cursor = buf.cursor
+                # Advance only by what this iteration actually emitted.
+                # Snapshot-then-send means writers can append more chunks
+                # while we're awaiting self._send, so we must NOT jump to
+                # buf.cursor — that would skip those concurrent chunks
+                # under slow-client / high-throughput conditions. Next
+                # iteration picks them up via the buf.chunks[cursor:]
+                # snapshot.
+                cursor += len(pending)
+                if cursor < buf.cursor:
+                    continue
                 if buf.complete:
                     await self._send({
                         "type": FRAME_RESPONSE_END,
@@ -291,7 +300,7 @@ class HermesRelay:
                 # drain and clear becomes a no-op next iteration when we
                 # re-check `chunks` before waiting again.
                 buf.progressed.clear()
-                if buf.cursor > cursor or buf.complete:
+                if cursor < buf.cursor or buf.complete:
                     continue
                 await buf.progressed.wait()
         except asyncio.CancelledError:

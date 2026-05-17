@@ -238,3 +238,59 @@ async def test_resume_tails_in_flight_response():
     assert b'"first"' in resume_body
     assert b'"second"' in resume_body
     assert b"response.completed" in resume_body
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_skip_chunks_appended_during_send():
+    """Regression: when the writer appends new chunks while _run_resume's
+    inner send loop is awaiting self._send(...), the old `cursor = buf.cursor`
+    advance would silently skip those chunks. With cursor += len(pending),
+    the next iteration's slice picks them up."""
+    from hermes_vylen_gateway.response_buffer import ResponseBufferRegistry
+
+    buffers = ResponseBufferRegistry(grace_seconds=300.0, max_bytes=1 << 20)
+    buf = buffers.create("resp_race", 200, {"Content-Type": "text/event-stream"})
+    buf.append(b"A")
+    buf.append(b"B")
+    buf.append(b"C")
+
+    sent: list[dict[str, Any]] = []
+    send_started = asyncio.Event()
+    end_seen = asyncio.Event()
+
+    async def slow_send(frame):
+        # Hold the very first chunk in flight long enough for the writer to
+        # append more — that's exactly the race the bug was about.
+        if frame["type"] == FRAME_RESPONSE_CHUNK and not send_started.is_set():
+            send_started.set()
+            await asyncio.sleep(0.05)
+        sent.append(frame)
+        if frame["type"] == FRAME_RESPONSE_END:
+            end_seen.set()
+
+    relay = HermesRelay(slow_send, response_buffers=buffers)
+    try:
+        await relay.handle_resume({
+            "type": FRAME_RESPONSE_RESUME,
+            "request_id": "req_race",
+            "response_id": "resp_race",
+            "after_cursor": 0,
+        })
+        # Wait for the resume task to begin sending, then append more.
+        await asyncio.wait_for(send_started.wait(), timeout=2.0)
+        buf.append(b"D")
+        buf.append(b"E")
+        await asyncio.sleep(0.05)
+        buf.finalize()
+        await asyncio.wait_for(end_seen.wait(), timeout=2.0)
+    finally:
+        await relay.close()
+
+    chunks = [
+        base64.b64decode(f["data"])
+        for f in sent
+        if f.get("type") == FRAME_RESPONSE_CHUNK
+    ]
+    assert chunks == [b"A", b"B", b"C", b"D", b"E"], (
+        f"resume dropped chunks under race: got {chunks!r}"
+    )
