@@ -448,57 +448,61 @@ class InProcessAgentRunner:
         ))
         task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
 
-        role_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        }
-        await _write_sse_data(writer, role_chunk)
-
-        last_activity = time.monotonic()
-        while True:
-            try:
-                item = await asyncio.wait_for(stream_q.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                if task.done():
-                    break
-                if time.monotonic() - last_activity >= _CHAT_KEEPALIVE_SECONDS:
-                    await writer.send_chunk(b": keepalive\n\n")
-                    last_activity = time.monotonic()
-                continue
-            if item is None:
-                break
-            if isinstance(item, tuple) and item[0] == "__tool_progress__":
-                await _write_sse_event(writer, "hermes.tool.progress", item[1])
-            else:
-                chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                }
-                await _write_sse_data(writer, chunk)
-            last_activity = time.monotonic()
-
-        usage: dict[str, int] = {}
         try:
-            _result, usage = await task
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("chat completion stream failed: %s", exc)
-        finish = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "usage": _chat_usage(usage),
-        }
-        await _write_sse_data(writer, finish)
-        await writer.send_chunk(b"data: [DONE]\n\n")
-        return 200
+            role_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+            await _write_sse_data(writer, role_chunk)
+
+            last_activity = time.monotonic()
+            while True:
+                try:
+                    item = await asyncio.wait_for(stream_q.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        break
+                    if time.monotonic() - last_activity >= _CHAT_KEEPALIVE_SECONDS:
+                        await writer.send_chunk(b": keepalive\n\n")
+                        last_activity = time.monotonic()
+                    continue
+                if item is None:
+                    break
+                if isinstance(item, tuple) and item[0] == "__tool_progress__":
+                    await _write_sse_event(writer, "hermes.tool.progress", item[1])
+                else:
+                    chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                    }
+                    await _write_sse_data(writer, chunk)
+                last_activity = time.monotonic()
+
+            usage: dict[str, int] = {}
+            try:
+                _result, usage = await task
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("chat completion stream failed: %s", exc)
+            finish = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": _chat_usage(usage),
+            }
+            await _write_sse_data(writer, finish)
+            await writer.send_chunk(b"data: [DONE]\n\n")
+            return 200
+        except asyncio.CancelledError:
+            await _cancel_stream_task(task, agent_ref, "SSE stream cancelled")
+            raise
 
     async def _responses(self, req: _ParsedRequest, writer: StreamWriter, api: Any) -> int:
         body = req.json_body()
@@ -696,182 +700,186 @@ class InProcessAgentRunner:
         persist(created_env)
         await event("response.created", {"type": "response.created", "response": created_env})
 
-        async def open_message() -> None:
-            nonlocal message_open, message_output_index, output_index
-            if message_open:
-                return
-            message_open = True
-            message_output_index = output_index
-            output_index += 1
-            await event("response.output_item.added", {
-                "type": "response.output_item.added",
-                "output_index": message_output_index,
-                "item": {
-                    "id": message_id,
-                    "type": "message",
-                    "status": "in_progress",
-                    "role": "assistant",
-                    "content": [],
-                },
-            })
-
-        async def emit_delta(delta: str) -> None:
-            await open_message()
-            final_parts.append(delta)
-            await event("response.output_text.delta", {
-                "type": "response.output_text.delta",
-                "item_id": message_id,
-                "output_index": message_output_index,
-                "content_index": 0,
-                "delta": delta,
-                "logprobs": [],
-            })
-
-        async def emit_tool_started(payload: dict[str, Any]) -> None:
-            nonlocal output_index
-            call_id = payload.get("tool_call_id") or f"call_{response_id[5:]}_{len(pending_tools) + 1}"
-            args = payload.get("arguments", {})
-            args_str = json.dumps(args) if isinstance(args, dict) else str(args)
-            item = {
-                "id": f"fc_{uuid.uuid4().hex[:24]}",
-                "type": "function_call",
-                "status": "in_progress",
-                "name": payload.get("name", ""),
-                "call_id": call_id,
-                "arguments": args_str,
-            }
-            idx = output_index
-            output_index += 1
-            pending_tools[call_id] = {"item": item, "index": idx}
-            emitted_items.append({
-                "type": "function_call",
-                "name": item["name"],
-                "arguments": args_str,
-                "call_id": call_id,
-            })
-            await event("response.output_item.added", {
-                "type": "response.output_item.added",
-                "output_index": idx,
-                "item": item,
-            })
-
-        async def emit_tool_completed(payload: dict[str, Any]) -> None:
-            nonlocal output_index
-            call_id = payload.get("tool_call_id")
-            pending = pending_tools.pop(call_id, None)
-            if pending is None:
-                return
-            item = dict(pending["item"])
-            item["status"] = "completed"
-            await event("response.output_item.done", {
-                "type": "response.output_item.done",
-                "output_index": pending["index"],
-                "item": item,
-            })
-            result = payload.get("result", "")
-            result_str = result if isinstance(result, str) else json.dumps(result)
-            out_item = {
-                "id": f"fco_{uuid.uuid4().hex[:24]}",
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": [{"type": "input_text", "text": result_str}],
-                "status": "completed",
-            }
-            idx = output_index
-            output_index += 1
-            emitted_items.append({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": out_item["output"],
-            })
-            await event("response.output_item.added", {
-                "type": "response.output_item.added",
-                "output_index": idx,
-                "item": out_item,
-            })
-            await event("response.output_item.done", {
-                "type": "response.output_item.done",
-                "output_index": idx,
-                "item": out_item,
-            })
-
-        last_activity = time.monotonic()
-        while True:
-            try:
-                item = await asyncio.wait_for(stream_q.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                if task.done():
-                    break
-                if time.monotonic() - last_activity >= _CHAT_KEEPALIVE_SECONDS:
-                    await writer.send_chunk(b": keepalive\n\n")
-                    last_activity = time.monotonic()
-                continue
-            if item is None:
-                break
-            if isinstance(item, tuple) and item[0] == "__tool_started__":
-                await emit_tool_started(item[1])
-            elif isinstance(item, tuple) and item[0] == "__tool_completed__":
-                await emit_tool_completed(item[1])
-            elif isinstance(item, str):
-                await emit_delta(item)
-            last_activity = time.monotonic()
-
-        usage: dict[str, int] = {}
-        result: dict[str, Any] = {}
-        agent_error: str | None = None
         try:
-            result, usage = await task
-            if result.get("final_response") and not final_parts:
-                await emit_delta(str(result["final_response"]))
-        except Exception as exc:  # noqa: BLE001
-            agent_error = str(exc)
-            logger.exception("response stream failed")
+            async def open_message() -> None:
+                nonlocal message_open, message_output_index, output_index
+                if message_open:
+                    return
+                message_open = True
+                message_output_index = output_index
+                output_index += 1
+                await event("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": message_output_index,
+                    "item": {
+                        "id": message_id,
+                        "type": "message",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                })
 
-        final_text = "".join(final_parts)
-        if message_open:
-            await event("response.output_text.done", {
-                "type": "response.output_text.done",
-                "item_id": message_id,
-                "output_index": message_output_index,
-                "content_index": 0,
-                "text": final_text,
-                "logprobs": [],
-            })
-            await event("response.output_item.done", {
-                "type": "response.output_item.done",
-                "output_index": message_output_index,
-                "item": {
-                    "id": message_id,
-                    "type": "message",
+            async def emit_delta(delta: str) -> None:
+                await open_message()
+                final_parts.append(delta)
+                await event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": message_id,
+                    "output_index": message_output_index,
+                    "content_index": 0,
+                    "delta": delta,
+                    "logprobs": [],
+                })
+
+            async def emit_tool_started(payload: dict[str, Any]) -> None:
+                nonlocal output_index
+                call_id = payload.get("tool_call_id") or f"call_{response_id[5:]}_{len(pending_tools) + 1}"
+                args = payload.get("arguments", {})
+                args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                item = {
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "name": payload.get("name", ""),
+                    "call_id": call_id,
+                    "arguments": args_str,
+                }
+                idx = output_index
+                output_index += 1
+                pending_tools[call_id] = {"item": item, "index": idx}
+                emitted_items.append({
+                    "type": "function_call",
+                    "name": item["name"],
+                    "arguments": args_str,
+                    "call_id": call_id,
+                })
+                await event("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": item,
+                })
+
+            async def emit_tool_completed(payload: dict[str, Any]) -> None:
+                nonlocal output_index
+                call_id = payload.get("tool_call_id")
+                pending = pending_tools.pop(call_id, None)
+                if pending is None:
+                    return
+                item = dict(pending["item"])
+                item["status"] = "completed"
+                await event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": pending["index"],
+                    "item": item,
+                })
+                result = payload.get("result", "")
+                result_str = result if isinstance(result, str) else json.dumps(result)
+                out_item = {
+                    "id": f"fco_{uuid.uuid4().hex[:24]}",
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": [{"type": "input_text", "text": result_str}],
                     "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": final_text}],
-                },
-            })
+                }
+                idx = output_index
+                output_index += 1
+                emitted_items.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": out_item["output"],
+                })
+                await event("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": out_item,
+                })
+                await event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": out_item,
+                })
 
-        final_items = list(emitted_items)
-        final_items.append({
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": final_text or (agent_error or "")}],
-        })
-        if agent_error:
-            failed_env = envelope("failed")
-            failed_env["output"] = final_items
-            failed_env["error"] = {"message": agent_error, "type": "server_error"}
-            failed_env["usage"] = _response_usage(usage)
-            persist(failed_env)
-            await event("response.failed", {"type": "response.failed", "response": failed_env})
-        else:
-            completed_env = envelope("completed")
-            completed_env["output"] = final_items
-            completed_env["usage"] = _response_usage(usage)
-            full_history = api._build_response_conversation_history(
-                conversation_history, user_message, result, final_text
-            )
-            persist(completed_env, full_history)
-            await event("response.completed", {"type": "response.completed", "response": completed_env})
-        return 200
+            last_activity = time.monotonic()
+            while True:
+                try:
+                    item = await asyncio.wait_for(stream_q.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        break
+                    if time.monotonic() - last_activity >= _CHAT_KEEPALIVE_SECONDS:
+                        await writer.send_chunk(b": keepalive\n\n")
+                        last_activity = time.monotonic()
+                    continue
+                if item is None:
+                    break
+                if isinstance(item, tuple) and item[0] == "__tool_started__":
+                    await emit_tool_started(item[1])
+                elif isinstance(item, tuple) and item[0] == "__tool_completed__":
+                    await emit_tool_completed(item[1])
+                elif isinstance(item, str):
+                    await emit_delta(item)
+                last_activity = time.monotonic()
+
+            usage: dict[str, int] = {}
+            result: dict[str, Any] = {}
+            agent_error: str | None = None
+            try:
+                result, usage = await task
+                if result.get("final_response") and not final_parts:
+                    await emit_delta(str(result["final_response"]))
+            except Exception as exc:  # noqa: BLE001
+                agent_error = str(exc)
+                logger.exception("response stream failed")
+
+            final_text = "".join(final_parts)
+            if message_open:
+                await event("response.output_text.done", {
+                    "type": "response.output_text.done",
+                    "item_id": message_id,
+                    "output_index": message_output_index,
+                    "content_index": 0,
+                    "text": final_text,
+                    "logprobs": [],
+                })
+                await event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": message_output_index,
+                    "item": {
+                        "id": message_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": final_text}],
+                    },
+                })
+
+            final_items = list(emitted_items)
+            final_items.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": final_text or (agent_error or "")}],
+            })
+            if agent_error:
+                failed_env = envelope("failed")
+                failed_env["output"] = final_items
+                failed_env["error"] = {"message": agent_error, "type": "server_error"}
+                failed_env["usage"] = _response_usage(usage)
+                persist(failed_env)
+                await event("response.failed", {"type": "response.failed", "response": failed_env})
+            else:
+                completed_env = envelope("completed")
+                completed_env["output"] = final_items
+                completed_env["usage"] = _response_usage(usage)
+                full_history = api._build_response_conversation_history(
+                    conversation_history, user_message, result, final_text
+                )
+                persist(completed_env, full_history)
+                await event("response.completed", {"type": "response.completed", "response": completed_env})
+            return 200
+        except asyncio.CancelledError:
+            await _cancel_stream_task(task, agent_ref, "SSE stream cancelled")
+            raise
 
     def _input_messages(self, raw_input: Any) -> list[dict[str, Any]]:
         if isinstance(raw_input, str):
@@ -1328,6 +1336,27 @@ async def _write_sse_data(writer: StreamWriter, payload: Any) -> None:
     await writer.send_chunk(
         f"data: {json.dumps(payload, separators=(',', ':'), default=str)}\n\n".encode("utf-8")
     )
+
+
+async def _cancel_stream_task(
+    task: asyncio.Future[Any],
+    agent_ref: list[Any] | None,
+    reason: str,
+) -> None:
+    agent = agent_ref[0] if agent_ref else None
+    if agent is not None:
+        try:
+            agent.interrupt(reason)
+        except Exception:
+            pass
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("stream task ended during cancellation cleanup: %s", exc)
 
 
 def _sse_headers(

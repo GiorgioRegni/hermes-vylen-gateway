@@ -96,6 +96,21 @@ class BlockingAPI(FakeAPI):
         return await super()._run_agent(**kwargs)
 
 
+class CancellableAPI(FakeAPI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def _run_agent(self, **kwargs):
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
 async def _dispatch(runner, method, path, body=None, headers=None):
     writer = CaptureWriter()
     await runner.dispatch(
@@ -226,3 +241,52 @@ async def test_sweeper_does_not_drop_active_run_handles_by_age():
 
     stopped = await _dispatch(runner, "POST", f"/v1/runs/{run_id}/stop", {})
     assert stopped.status == 200
+
+
+@pytest.mark.asyncio
+async def test_stream_response_cancels_spawned_agent_task():
+    api = CancellableAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    writer = CaptureWriter()
+    task = asyncio.create_task(
+        runner.dispatch(
+            "POST",
+            "/v1/responses",
+            {"Content-Type": "application/json"},
+            json.dumps({"input": "hi", "stream": True}).encode("utf-8"),
+            writer,
+        )
+    )
+    await asyncio.wait_for(api.started.wait(), timeout=1.0)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert api.cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_cancels_spawned_agent_task():
+    api = CancellableAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    writer = CaptureWriter()
+    task = asyncio.create_task(
+        runner.dispatch(
+            "POST",
+            "/v1/chat/completions",
+            {"Content-Type": "application/json"},
+            json.dumps({
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }).encode("utf-8"),
+            writer,
+        )
+    )
+    await asyncio.wait_for(api.started.wait(), timeout=1.0)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert api.cancelled.is_set()
