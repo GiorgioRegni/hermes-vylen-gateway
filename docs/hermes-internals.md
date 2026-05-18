@@ -1,205 +1,159 @@
-# Hermes integration internals
+# Hermes Integration Internals
 
-What you need to know about how this plugin plugs into `hermes-agent`. Distilled from spelunking + a Docker dogfooding session; written down so the next person doesn't re-discover any of it.
+This document records the Hermes-specific loader and runtime behavior that the
+Vylen gateway plugin depends on. It is intentionally focused on the public
+plugin package, not on Vylen Cloud internals.
 
-The spec for the whole epic lives at [docs/specs/001-hermes-gateway.md](../../docs/specs/001-hermes-gateway.md). This file is the operational layer underneath that.
+## How Hermes Discovers Plugins
 
----
+Hermes scans plugins from three sources, in priority order:
 
-## How Hermes discovers plugins
+1. Bundled plugins under the Hermes repository.
+2. User plugins under `~/.hermes/plugins/<name>/`.
+3. Python entry-point packages that declare
+   `[project.entry-points."hermes_agent.plugins"]`.
 
-Hermes scans plugins from three sources, in priority order (bundled < user < project):
+This package uses the third mechanism:
 
-1. **Bundled** — directories under `<hermes-repo>/plugins/<name>/` with a `plugin.yaml`. Auto-loaded.
-2. **User** — directories under `~/.hermes/plugins/<name>/` with a `plugin.yaml`. Gated by `plugins.enabled` in `~/.hermes/config.yaml`.
-3. **Entry-point** — pip-installed packages that declare `[project.entry-points."hermes_agent.plugins"]` in pyproject.toml. **Also gated by `plugins.enabled`.** This is how Vylen plugs in.
-
-Discovery happens via `hermes_cli.plugins.discover_plugins()`, which is called by `gateway/run.py` at startup, by `hermes_cli/main.py` for the CLI path, and idempotently from `_apply_env_overrides` in `gateway/config.py`.
-
-## The entry-point contract (the bit that bit us first)
-
-Hermes's loader does:
-
-```python
-module = entry_point.load()
-register_fn = getattr(module, "register", None)
-register_fn(ctx)
+```toml
+[project.entry-points."hermes_agent.plugins"]
+vylen = "hermes_vylen_gateway"
 ```
 
-`entry_point.load()` returns whatever the entry-point string points at:
+Hermes loads the module and then calls its top-level `register(ctx)` function.
+The entry point must point at the module, not at `hermes_vylen_gateway:register`.
 
-- `"hermes_vylen_gateway"` → the module ✅
-- `"hermes_vylen_gateway:register"` → the `register` *function* ❌ (then `getattr(fn, "register")` is None → "Plugin 'X' has no register() function")
+## `plugins.enabled`
 
-**Rule:** entry-points in `[project.entry-points."hermes_agent.plugins"]` must reference the **module**, not the function inside it. The module must export a top-level `register` callable.
-
-## `plugins.enabled` gates entry-point plugins
-
-By default, even an entry-point plugin that's installed in the venv is **opt-in**. The user must list it in `~/.hermes/config.yaml`:
-
-```yaml
-plugins:
-  enabled:
-    - vylen
-```
-
-Caveat: `hermes plugins enable <name>` only recognises filesystem plugins (user/bundled directories with `plugin.yaml`). For entry-point plugins it errors "Plugin 'X' is not installed or bundled." Run `hermes-vylen-gateway init` after installing the package; it idempotently adds `vylen` to `plugins.enabled` without touching platform config.
-
-## The Platform enum
-
-`gateway/config.py` defines `class Platform(Enum)` with the bundled platforms (TELEGRAM, DISCORD, …). Plugin platforms get dynamic members via `Platform._missing_`:
-
-- `Platform("vylen")` works because our `register(ctx)` calls `ctx.register_platform(name="vylen", …)`, which registers in `platform_registry`. `Platform._missing_` then sees `platform_registry.is_registered("vylen")` and mints a pseudo-member.
-- **There is no `Platform.GENERIC`** — don't try to default to it. Use `Platform("vylen")` in the adapter's `__init__`.
-
-## What `ctx.register_platform` accepts
-
-From `hermes_cli/plugins.py`:
-
-```python
-ctx.register_platform(
-    name="vylen",                     # must match Platform("vylen") lookup
-    label="Vylen",
-    adapter_factory=factory_callable, # receives PlatformConfig → BasePlatformAdapter
-    check_fn=callable_returning_bool, # gate: required env vars present?
-    required_env=["VYLEN_INSTANCE_TOKEN"],
-    install_hint="...",               # shown on missing-env error
-    **entry_kwargs,                   # e.g. emoji, setup_fn, env_enablement_fn
-)
-```
-
-`check_fn` is the auto-enable gate. The gateway config loader (`_apply_env_overrides`) walks `platform_registry.plugin_entries()`, calls each `check_fn()`, and for the ones that return True sets `config.platforms[Platform(name)].enabled = True`. So if `VYLEN_INSTANCE_TOKEN` is set, our platform auto-enables on `hermes gateway run`.
-
-## `BasePlatformAdapter` abstract methods
-
-Four abstractmethods on `gateway/platforms/base.py:BasePlatformAdapter` you must implement (the rest have defaults):
-
-- `async connect() -> bool`
-- `async disconnect() -> None`
-- `async send(chat_id, content, reply_to=None, metadata=None) -> SendResult`
-- `async get_chat_info(chat_id) -> Dict`
-
-Useful concrete methods that may want overrides: `send_image`, `send_voice`, `send_video`, `send_document`, `edit_message`, `delete_message`, `create_handoff_thread`. (Checkpoint 6 here.)
-
-## How inbound messages reach Hermes
-
-Hermes platform adapters dispatch user input as a `MessageEvent` (defined in `gateway/platforms/base.py`):
-
-```
-event = MessageEvent(
-    text="...",
-    message_type=MessageType.TEXT,    # or VOICE / PHOTO / AUDIO / DOCUMENT
-    source=SessionSource(platform="vylen", chat_id=..., user_id=..., chat_type="dm"),
-    media_urls=["/local/cache/path.ogg"],  # for audio/image/file paths
-    media_types=["audio/ogg"],
-    reply_to_message_id=None,
-    ...
-)
-await self.handle_message(event)
-```
-
-For audio specifically, Hermes's gateway runner auto-transcribes `event.media_urls` of `audio/*` via `tools/transcription_tools.py` (faster-whisper or OpenAI Whisper, gated by `stt.enabled` in config). The transcript is prepended to `event.text` as `[The user sent a voice message. Here's what they said: "..."]` before the LLM sees it.
-
-## Cron-driven outbound push
-
-`cron/scheduler.py` keeps an in-process weakref to each registered adapter and calls `adapter.send(chat_id, content)` when a scheduled job fires. The adapter's `send()` is the only path that needs to know how to deliver to its platform. There's no separate "push" API — same `send`.
-
-### The resolver-gate that bit us second
-
-Before `adapter.send` is called, `cron/scheduler.py:_resolve_single_delivery_target` (around line 258) decides *if* the platform is a valid `deliver=<name>` target. For plugin platforms it requires **both**:
-
-1. `PlatformEntry.cron_deliver_env_var` is a non-empty string (passed to `ctx.register_platform(..., cron_deliver_env_var="VYLEN_HOME_CHAT_ID")`).
-2. The named env var holds a non-empty value at resolution time. The resolver passes that value through as the `chat_id` argument of the eventual `adapter.send(chat_id, content)` call — it's the "home channel id" for platforms like IRC where it actually matters.
-
-When either is missing the resolver returns `None` silently and the scheduler logs `WARNING cron.scheduler: Job '<id>': no delivery target resolved for deliver=vylen`. The job ticks every minute and drops its output every minute — no exception, no retry, nothing on the cloud side.
-
-For Vylen, the chat_id has no real meaning (the cloud fans out by `user_id`, not `chat_id`), so the plugin defaults `VYLEN_HOME_CHAT_ID=inbox` in `register()` via `os.environ.setdefault`. That makes `--deliver vylen` work out of the box; users can override the env var if a future revision splits the inbox into multiple buckets.
-
-### Cron payload chrome
-
-Hermes wraps cron output in an envelope before invoking `send`:
-
-```
-Cronjob Response: <job-name>
-(job_id: <id>)
--------------
-
-<actual content>
-
-To stop or manage this job, send me a new message (e.g. "stop reminder <job-name>").
-```
-
-Useful on chat platforms where the user issued the cron interactively; verbose for Vylen's inbox. We currently render it as-is; a future revision can strip the envelope in `VylenGatewayAdapter.send()` if the verbosity grates.
-
----
-
-## Docker / install operational notes
-
-The Hermes container (image `nousresearch/hermes-agent`) is opinionated:
-
-- **Hermes home** is `/opt/data` inside the container, bind-mounted from `~/.hermes/` on the host. Contains `config.yaml`, `state.db`, etc. Always mount this; deleting it loses sessions.
-- **Hermes venv** is at `/opt/hermes/.venv/`. Lives in the container layer — **`docker compose up -d` recreates wipe it** when the compose spec changes.
-- **No `pip` on PATH** — the image uses `uv`. To install into the venv: `VIRTUAL_ENV=/opt/hermes/.venv uv pip install -e /opt/vylen-gateway-plugin`.
-- **`hermes` binary isn't on PATH globally** — it's at `/opt/hermes/.venv/bin/hermes`. From `docker compose exec` you usually need the absolute path: `docker compose exec hermes /opt/hermes/.venv/bin/vylen-gateway-pair ...`.
-- **Process user is `hermes` (UID 10000)**, not the host user. The entrypoint drops privileges via `gosu`.
-- **`extra_hosts: - host.docker.internal:host-gateway`** is required on Linux/WSL2 Docker for `host.docker.internal` to resolve to the host. Docker Desktop sets this automatically; rootless / Linux Docker doesn't.
-
-## Editable install + iteration
-
-The standard dev loop:
+Entry-point plugins are gated by `plugins.enabled` in Hermes' `config.yaml`.
+After installation, run:
 
 ```bash
-# One-time after any compose recreate:
-docker compose exec hermes bash -c 'VIRTUAL_ENV=/opt/hermes/.venv uv pip install -e /opt/vylen-gateway-plugin'
-
-# For pure .py source edits afterwards:
-docker compose restart hermes      # picks up edits in ~3-5s
+hermes-vylen-gateway init
 ```
 
-Two gotchas:
+The command creates or updates the Hermes config and adds `vylen` to
+`plugins.enabled` without changing platform settings.
 
-- **Stale `__pycache__`** in the bind-mount can shadow source edits when the host venv (used by pytest) writes `.pyc` files Python prefers over freshly-edited `.py`. Symptom: code change "doesn't apply" — the error stack references a line number that doesn't match the current source.
-  Nuke: `find vylen/gateway-plugin/src -name __pycache__ -exec rm -rf {} +`
-- **Container recreate wipes the venv install.** If `docker compose up -d hermes` runs after any compose change, you must re-run the `uv pip install -e ...` step. `docker compose restart hermes` preserves the install. Baking the install into the container `command:` is possible but adds complexity; we chose to keep it manual.
+## Platform Registration
 
-## Debugging recipes
+`register(ctx)` registers a dynamic Hermes platform named `vylen`.
 
-Plugin not loading? Run discovery manually with debug logging:
+The adapter depends on Hermes' plugin platform registry accepting a registration
+with:
+
+- `name="vylen"`
+- `adapter_factory`
+- `check_fn`
+- `required_env=["VYLEN_INSTANCE_TOKEN"]`
+- `cron_deliver_env_var="VYLEN_HOME_CHAT_ID"`
+
+`check_fn` returns true only when the gateway environment is valid. The gateway
+config loader then auto-enables the platform for the current Hermes process.
+
+## Required Adapter Methods
+
+Hermes platform adapters implement the `BasePlatformAdapter` contract:
+
+- `connect()`
+- `disconnect()`
+- `send(chat_id, content, reply_to=None, metadata=None)`
+- `get_chat_info(chat_id)`
+
+The Vylen adapter uses `connect()` to start the WebSocket supervisor. Inbound
+client requests are not converted into Hermes `MessageEvent` objects; they are
+handled through an in-process OpenAI-compatible request dispatcher in
+`agent_runner.py`.
+
+`send()` is the Hermes-to-Vylen push path. Hermes cron delivery and many media
+helpers eventually call `send()` or a nearby adapter method. The plugin emits a
+small `push` frame to Vylen Cloud and lets clients fetch media through
+short-lived blob tokens when needed.
+
+## In-Process Request Handling
+
+Vylen Cloud still sends HTTP-shaped request frames over the gateway WebSocket.
+The plugin handles those frames directly inside Hermes rather than forwarding
+them to Hermes' loopback API server.
+
+`agent_runner.py` mirrors the OpenAI-compatible Hermes API surface needed by
+Vylen clients, including:
+
+- health and capability endpoints;
+- chat completions;
+- responses;
+- long-running runs and run events;
+- run stop and approval flows.
+
+This avoids local API-server configuration, avoids browser-origin issues, and
+keeps the gateway as a single outbound connection from the Hermes process.
+
+## Cron Delivery
+
+Hermes resolves `--deliver vylen` only when the plugin registration declares a
+cron delivery env var and that env var has a non-empty value. The plugin sets:
 
 ```bash
-docker compose exec hermes /opt/hermes/.venv/bin/python -c '
-import logging; logging.basicConfig(level=logging.DEBUG)
+VYLEN_HOME_CHAT_ID=inbox
+```
+
+when the user has not provided a value. Vylen routes by the paired instance and
+owning user, so the chat id is a compatibility bucket for Hermes' delivery
+resolver.
+
+Hermes may wrap cron output in a text envelope before calling `send()`. The
+plugin strips the common envelope form and sends structured `cron_job_id` and
+`cron_job_name` fields when they are available.
+
+## Docker Notes
+
+The common Hermes container layout is:
+
+- Hermes home at `/opt/data`;
+- Hermes virtualenv at `/opt/hermes/.venv`;
+- Hermes binary at `/opt/hermes/.venv/bin/hermes`.
+
+Container recreation can wipe packages installed into the virtualenv. If the
+container is recreated, reinstall the package into that environment:
+
+```bash
+docker compose exec hermes bash -lc \
+  'VIRTUAL_ENV=/opt/hermes/.venv uv pip install hermes-vylen-gateway'
+```
+
+For editable development against a checkout:
+
+```bash
+docker compose exec hermes bash -lc \
+  'VIRTUAL_ENV=/opt/hermes/.venv uv pip install -e /path/to/hermes-vylen-gateway'
+docker compose restart hermes
+```
+
+## Debugging
+
+Run plugin discovery manually inside the Hermes environment:
+
+```bash
+python -c '
+import logging
+logging.basicConfig(level=logging.DEBUG)
 from hermes_cli.plugins import discover_plugins
 discover_plugins()
 '
 ```
 
-Watch for:
+Common symptoms:
 
-- `Skipping 'X' (not in plugins.enabled)` → add to config.yaml
-- `Plugin 'X' has no register() function` → fix entry-point to point at module, not function
-- `Failed to create adapter for platform 'X': ...` → adapter `__init__` error
+- `Skipping 'vylen' (not in plugins.enabled)` means run
+  `hermes-vylen-gateway init`.
+- `Plugin has no register() function` means the package entry point is wrong.
+- `VYLEN_INSTANCE_TOKEN is not set` means the plugin is installed but not
+  configured for a paired instance.
 
-### Chat returns "Vylen API request failed with 403"
-
-The usual cause is instance ownership:
-
-- **Conversation bound to an instance owned by a different user** — the cloud's `proxyHermes` returns 403 on owner mismatch. Confirm by comparing the conversation's `instance_id` (in `localStorage.vylen.conversations.v1`) against `curl /v1/instances` for each user. The `clearConversationInstance` auto-heal in `useHermesStream` drops the binding so the next pick from the UI works; if you keep retrying the same dead conversation it'll keep failing.
-
-The old local API-server causes no longer apply to Vylen chat traffic. The plugin invokes Hermes in-process, so browser `Origin` headers and local `API_SERVER_KEY` mismatches are not part of the Vylen request path.
-
-Plugin loads but won't connect? Run the doctor:
+Check whether Hermes sees the platform:
 
 ```bash
-docker compose exec hermes /opt/hermes/.venv/bin/vylen-gateway-doctor --keep-open 5
-```
-
-That bypasses the gateway runner entirely and dials cloud directly. If the doctor succeeds and `hermes gateway run` doesn't, the issue is in the gateway loader path; if the doctor fails, the issue is in the plugin / network / cloud.
-
-Check what platforms Hermes thinks are enabled at runtime:
-
-```bash
-docker compose exec hermes /opt/hermes/.venv/bin/python -c '
+python -c '
 from gateway.config import load_gateway_config
 cfg = load_gateway_config()
 for p, pc in cfg.platforms.items():
@@ -207,15 +161,7 @@ for p, pc in cfg.platforms.items():
 '
 ```
 
-## Key file references (in `external/hermes-agent/`)
-
-When you need to read upstream:
-
-- [hermes_cli/plugins.py](../../../external/hermes-agent/hermes_cli/plugins.py) — `PluginManager`, `_load_entrypoint_module`, `discover_and_load`. The single source of truth for plugin loading.
-- [hermes_cli/plugins_cmd.py](../../../external/hermes-agent/hermes_cli/plugins_cmd.py) — `hermes plugins enable / disable / list` commands.
-- [gateway/platform_registry.py](../../../external/hermes-agent/gateway/platform_registry.py) — `PlatformRegistry`, `PlatformEntry`. How platforms get registered.
-- [gateway/platforms/base.py](../../../external/hermes-agent/gateway/platforms/base.py) — `BasePlatformAdapter`, `MessageEvent`, `Platform` enum members.
-- [gateway/config.py](../../../external/hermes-agent/gateway/config.py) — `load_gateway_config`, `_apply_env_overrides`. Where plugins auto-enable.
-- [gateway/run.py](../../../external/hermes-agent/gateway/run.py) — `GatewayRunner`. Where `discover_plugins()` is called at startup (around line 3375).
-- [cron/scheduler.py](../../../external/hermes-agent/cron/scheduler.py) — push path from cron jobs to `adapter.send`.
-
+The upstream Hermes implementation is available at
+https://github.com/NousResearch/hermes-agent. Useful files to inspect there
+include the plugin loader, platform registry, gateway config, gateway runner,
+base platform adapter, and cron scheduler.

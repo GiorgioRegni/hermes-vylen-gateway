@@ -1,7 +1,29 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Build artifacts
 build/
 dist/
-.pytest_cache/
+*.whl
+
+# Editors and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local env
+.env
+.env.*
+!.env.example
