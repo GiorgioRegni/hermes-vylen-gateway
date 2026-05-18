@@ -15,6 +15,7 @@ in the Vylen monorepo.
 
 ```bash
 pip install hermes-vylen-gateway
+hermes-vylen-gateway init
 ```
 
 Set the instance token in `~/.hermes/.env` (or wherever you run Hermes from):
@@ -42,7 +43,11 @@ hermes gateway
 ```
 
 Hermes discovers this plugin through the `hermes_agent.plugins` entry point
-and registers the `vylen` platform automatically.
+after `hermes-vylen-gateway init` adds `vylen` to `plugins.enabled`.
+
+The plugin invokes Hermes in-process. You do not need to enable
+`platforms.api_server`, set a loopback URL, or configure a local API-server
+key for Vylen.
 
 ## Verifying setup
 

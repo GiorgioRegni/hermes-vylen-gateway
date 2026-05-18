@@ -1,10 +1,8 @@
-"""Periodic Hermes health probe + heartbeat sender.
+"""Periodic Hermes health reporter.
 
-Without this, the cloud has no way to learn that the local Hermes is reachable
-and so the instance pill in mobile/web shows "Degraded" forever (instance is
-WS-connected but hermes_status remains "unknown"). The probe runs on a small
-interval, hits the same Hermes URL the relay uses, and emits a `health` frame
-with `hermes_status` derived from the probe result.
+Without this, the cloud has no way to learn that local in-process Hermes
+dispatch is usable and so the instance pill in mobile/web shows "Degraded"
+forever (instance is WS-connected but hermes_status remains "unknown").
 """
 
 from __future__ import annotations
@@ -15,12 +13,11 @@ import os
 import time
 from typing import Any, Awaitable, Callable
 
-import httpx
+from .agent_runner import check_available
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HEALTH_INTERVAL_S = 15.0
-HEALTH_TIMEOUT_S = 3.0
 
 FRAME_HEARTBEAT = "heartbeat"
 FRAME_HEALTH = "health"
@@ -33,15 +30,9 @@ class HealthReporter:
     def __init__(
         self,
         send_frame: Callable[[dict[str, Any]], Awaitable[None]],
-        hermes_url: str,
-        hermes_api_key: str | None = None,
         interval_s: float | None = None,
     ):
         self._send = send_frame
-        self._url = hermes_url.rstrip("/") + "/health"
-        self._headers: dict[str, str] = {}
-        if hermes_api_key:
-            self._headers["Authorization"] = f"Bearer {hermes_api_key}"
         self._interval = interval_s if interval_s is not None else _interval_from_env()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -91,20 +82,11 @@ class HealthReporter:
 
     async def _probe(self) -> tuple[str, int, str | None]:
         started = time.perf_counter()
-        try:
-            async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S) as client:
-                resp = await client.get(self._url, headers=self._headers)
-        except httpx.TimeoutException:
-            return "unreachable", int((time.perf_counter() - started) * 1000), "timeout"
-        except httpx.HTTPError as exc:
-            return "unreachable", int((time.perf_counter() - started) * 1000), str(exc)
-
+        ok, error = check_available()
         elapsed_ms = int((time.perf_counter() - started) * 1000)
-        if resp.status_code == 401 or resp.status_code == 403:
-            return "auth_failed", elapsed_ms, f"hermes /health returned {resp.status_code}"
-        if 200 <= resp.status_code < 300:
+        if ok:
             return "ok", elapsed_ms, None
-        return "unreachable", elapsed_ms, f"hermes /health returned {resp.status_code}"
+        return "unreachable", elapsed_ms, error
 
 
 def _interval_from_env() -> float:

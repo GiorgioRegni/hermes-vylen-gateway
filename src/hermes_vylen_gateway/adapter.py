@@ -224,17 +224,13 @@ def make_adapter_class():
                 blobs=self._blobs,
                 response_buffers=self._response_buffers,
             )
-            self._health = HealthReporter(
-                client.send,
-                hermes_url=self._relay.hermes_url,
-                hermes_api_key=os.environ.get("VYLEN_HERMES_API_KEY") or None,
-            )
+            self._health = HealthReporter(client.send)
             self._health.start()
             self._transcribe = Transcriber(client.send)
             self._memory = MemoryRPC(client.send)
             logger.info(
-                "Vylen gateway online: instance_id=%s user_id=%s hermes=%s",
-                ready.instance_id, ready.user_id, self._relay.hermes_url,
+                "Vylen gateway online: instance_id=%s user_id=%s hermes=in-process",
+                ready.instance_id, ready.user_id,
             )
             return True
 

@@ -43,7 +43,7 @@ plugins:
     - vylen
 ```
 
-Caveat: `hermes plugins enable <name>` only recognises filesystem plugins (user/bundled directories with `plugin.yaml`). For entry-point plugins it errors "Plugin 'X' is not installed or bundled." You have to write `plugins.enabled` directly. We bootstrap this in the install recipe with a one-liner against `/opt/data/config.yaml`.
+Caveat: `hermes plugins enable <name>` only recognises filesystem plugins (user/bundled directories with `plugin.yaml`). For entry-point plugins it errors "Plugin 'X' is not installed or bundled." Run `hermes-vylen-gateway init` after installing the package; it idempotently adds `vylen` to `plugins.enabled` without touching platform config.
 
 ## The Platform enum
 
@@ -182,22 +182,11 @@ Watch for:
 
 ### Chat returns "Vylen API request failed with 403"
 
-Three distinct causes, in order of how often we've hit them:
+The usual cause is instance ownership:
 
-1. **Conversation bound to an instance owned by a different user** — the cloud's `proxyHermes` returns 403 on owner mismatch. Confirm by comparing the conversation's `instance_id` (in `localStorage.vylen.conversations.v1`) against `curl /v1/instances` for each user. The `clearConversationInstance` auto-heal in `useHermesStream` drops the binding so the next pick from the UI works; if you keep retrying the same dead conversation it'll keep failing.
+- **Conversation bound to an instance owned by a different user** — the cloud's `proxyHermes` returns 403 on owner mismatch. Confirm by comparing the conversation's `instance_id` (in `localStorage.vylen.conversations.v1`) against `curl /v1/instances` for each user. The `clearConversationInstance` auto-heal in `useHermesStream` drops the binding so the next pick from the UI works; if you keep retrying the same dead conversation it'll keep failing.
 
-2. **`Origin` header forwarded to Hermes** — Hermes's API server rejects browser-style `Origin` / `Referer` / `Sec-Fetch-*` headers with 403 (CSRF defense). The relay strips these explicitly in `relay._DROP_REQUEST_HEADERS`. Smoke this differential with curl:
-   ```bash
-   curl -X POST .../v1/responses -H 'Content-Type: application/json' -d '{"input":"hi","stream":true}'
-   # vs
-   curl -X POST .../v1/responses -H 'Content-Type: application/json' -H 'Origin: http://example' -d '{"input":"hi","stream":true}'
-   ```
-   If the second 403s and the first 200s, a browser-style header is being passed through to Hermes — add it to the drop-list.
-
-3. **Local Hermes API key mismatch** — Hermes returns 403 when `Authorization: Bearer <key>` doesn't match the one configured in its `config.yaml` / env. Confirm `$VYLEN_HERMES_API_KEY` inside the container equals what Hermes expects:
-   ```bash
-   docker compose exec hermes printenv VYLEN_HERMES_API_KEY API_SERVER_KEY
-   ```
+The old local API-server causes no longer apply to Vylen chat traffic. The plugin invokes Hermes in-process, so browser `Origin` headers and local `API_SERVER_KEY` mismatches are not part of the Vylen request path.
 
 Plugin loads but won't connect? Run the doctor:
 

@@ -1,5 +1,5 @@
-"""HTTP-tunnel relay: bridges gateway WS request frames to a local Hermes
-HTTP API, streaming the response chunks back as WS response frames.
+"""Gateway request relay: bridges gateway WS request frames to in-process
+Hermes agent execution, streaming response bytes back as WS response frames.
 
 This is the chat path. Cron push and multimodal-via-MessageEvent are a
 different code path (checkpoint 6) that uses `BasePlatformAdapter.send` style
@@ -15,8 +15,7 @@ import logging
 import os
 from typing import Any, Awaitable, Callable, Optional
 
-import httpx
-
+from . import agent_runner
 from .blobs import BLOB_PATH_PREFIX, BlobRegistry
 from .response_buffer import (
     ResponseBuffer,
@@ -39,9 +38,6 @@ FRAME_RESPONSE_CHUNK = "response_chunk"
 FRAME_RESPONSE_END = "response_end"
 FRAME_RESPONSE_ERROR = "response_error"
 FRAME_RESPONSE_RESUME = "response_resume"
-
-DEFAULT_HERMES_URL = "http://127.0.0.1:8000"
-
 
 def _resolve_request_timeout() -> float | None:
     """Read `VYLEN_HERMES_TIMEOUT` (seconds). Empty/unset → 5 minutes;
@@ -68,15 +64,11 @@ class HermesRelay:
     def __init__(
         self,
         send_frame: Callable[[dict[str, Any]], Awaitable[None]],
-        hermes_url: str | None = None,
-        hermes_api_key: str | None = None,
         request_timeout: float | None = None,
         blobs: Optional[BlobRegistry] = None,
         response_buffers: Optional[ResponseBufferRegistry] = None,
     ):
         self._send = send_frame
-        self._hermes_url = (hermes_url or os.environ.get("VYLEN_HERMES_URL", DEFAULT_HERMES_URL)).rstrip("/")
-        self._hermes_api_key = (hermes_api_key or os.environ.get("VYLEN_HERMES_API_KEY", "")).strip()
         # Shared blob registry — populated by the adapter when Hermes
         # produces an image; served by `_serve_blob` when the cloud tunnels
         # a request to `/__vylen_blob__/<token>`.
@@ -85,30 +77,13 @@ class HermesRelay:
         # resume (tests, blob-only mocks) can omit it; the adapter wires a
         # real registry in production. See spec 003.
         self._response_buffers = response_buffers
-        # Bound the local Hermes call lifetime so a hung backend (socket
-        # accepted but no response bytes, model server stalled, etc.)
-        # can't accumulate background tasks indefinitely — cloud-side
-        # timeouts only stop *waiting* for the response, they don't
-        # cancel plugin work. The default (5 minutes total per request,
-        # 30s to receive the first byte) is generous enough for the
-        # longest tool-using LLM runs but finite. Override per-test via
-        # the constructor arg or globally via `VYLEN_HERMES_TIMEOUT`
-        # (seconds; "none" disables the bound — only for diagnostics).
+        # Bound the in-process Hermes call lifetime so a hung model/tool
+        # path can't accumulate background tasks indefinitely. The default
+        # mirrors the former HTTP relay timeout.
         if request_timeout is None:
             request_timeout = _resolve_request_timeout()
-        if request_timeout is None:
-            timeout: httpx.Timeout | None = None
-        else:
-            # Generous read window so streaming /v1/responses runs can
-            # span minutes between SSE chunks; tight connect/pool/write so
-            # network-level stalls fail fast.
-            timeout = httpx.Timeout(request_timeout, connect=30.0, pool=10.0, write=30.0)
-        self._client = httpx.AsyncClient(timeout=timeout)
+        self._request_timeout = request_timeout
         self._tasks: set[asyncio.Task] = set()
-
-    @property
-    def hermes_url(self) -> str:
-        return self._hermes_url
 
     async def handle(self, frame: dict[str, Any]) -> None:
         """Schedule one request. Returns immediately; reply happens in the
@@ -148,7 +123,7 @@ class HermesRelay:
                 await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        await self._client.aclose()
+        return None
 
     async def _run(self, request_id: str, frame: dict[str, Any]) -> None:
         method = frame.get("method") or "GET"
@@ -169,77 +144,29 @@ class HermesRelay:
             await self._send_error(request_id, "BAD_REQUEST", f"could not decode body: {exc}")
             return
 
-        url = self._hermes_url + path
         forwarded = _filter_request_headers(headers)
-        if self._hermes_api_key and "authorization" not in {k.lower() for k in forwarded}:
-            # Local Hermes API is bearer-authenticated in compose setups.
-            # Surface the key from env so the plugin can satisfy that
-            # without the upstream client knowing about it.
-            forwarded["Authorization"] = f"Bearer {self._hermes_api_key}"
-        logger.debug("relay -> %s %s (request_id=%s)", method, url, request_id)
-        # Resume buffering state. We don't know the Hermes response_id until
-        # the `response.created` SSE event arrives, so we pre-buffer chunks
-        # in `preroll` and graduate to a real buffer once the id is found.
-        # If the id never arrives (non-SSE response, error, etc.) we just
-        # drop the preroll and the response is non-resumable.
-        extractor: Optional[ResponseIdExtractor] = (
-            ResponseIdExtractor() if self._response_buffers is not None else None
+        logger.debug("relay -> %s %s (request_id=%s)", method, path, request_id)
+        writer = _FrameStreamWriter(
+            send=self._send,
+            request_id=request_id,
+            response_buffers=self._response_buffers,
         )
-        preroll: list[bytes] = []
-        buffer: Optional[ResponseBuffer] = None
-        seen_headers: dict[str, str] = {}
-        seen_status: int = 0
         try:
-            async with self._client.stream(
-                method, url, content=body, headers=forwarded
-            ) as resp:
-                seen_status = resp.status_code
-                seen_headers = _filter_response_headers(dict(resp.headers))
-                await self._send({
-                    "type": FRAME_RESPONSE_HEADERS,
-                    "request_id": request_id,
-                    "status": seen_status,
-                    "headers": seen_headers,
-                })
-                async for chunk in resp.aiter_raw():
-                    if not chunk:
-                        continue
-                    await self._send({
-                        "type": FRAME_RESPONSE_CHUNK,
-                        "request_id": request_id,
-                        "data": base64.b64encode(chunk).decode("ascii"),
-                    })
-                    if extractor is None:
-                        continue
-                    if buffer is not None:
-                        buffer.append(chunk)
-                        continue
-                    rid = extractor.feed(chunk)
-                    if rid is None:
-                        preroll.append(chunk)
-                        continue
-                    assert self._response_buffers is not None
-                    buffer = self._response_buffers.create(rid, seen_status, seen_headers)
-                    for prev in preroll:
-                        buffer.append(prev)
-                    preroll.clear()
-                    buffer.append(chunk)
-                if buffer is not None:
-                    buffer.finalize()
-                await self._send({
-                    "type": FRAME_RESPONSE_END,
-                    "request_id": request_id,
-                })
-        except httpx.HTTPError as exc:
-            _abandon_buffer(buffer, self._response_buffers)
-            logger.warning("relay error for %s %s: %s", method, url, exc)
-            await self._send_error(request_id, "HERMES_UNREACHABLE", str(exc))
+            coro = agent_runner.dispatch(method, path, forwarded, body, writer)
+            if self._request_timeout is None:
+                await coro
+            else:
+                await asyncio.wait_for(coro, timeout=self._request_timeout)
+        except asyncio.TimeoutError:
+            writer.abandon()
+            logger.warning("relay timeout for %s %s", method, path)
+            await self._send_error(request_id, "HERMES_TIMEOUT", "Hermes request timed out")
         except asyncio.CancelledError:
-            _abandon_buffer(buffer, self._response_buffers)
+            writer.abandon()
             raise
         except Exception as exc:  # noqa: BLE001
-            _abandon_buffer(buffer, self._response_buffers)
-            logger.exception("relay crashed for %s %s", method, url)
+            writer.abandon()
+            logger.exception("relay crashed for %s %s", method, path)
             await self._send_error(request_id, "RELAY_ERROR", str(exc))
 
     async def _run_resume(
@@ -380,6 +307,87 @@ class HermesRelay:
             "code": code,
             "message": message,
         })
+
+
+class _FrameStreamWriter:
+    """Converts in-process dispatcher writes into gateway response frames.
+
+    It also preserves the resumable-response buffering behavior around raw
+    response chunks.
+    """
+
+    def __init__(
+        self,
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+        request_id: str,
+        response_buffers: Optional[ResponseBufferRegistry],
+    ) -> None:
+        self._send = send
+        self._request_id = request_id
+        self._response_buffers = response_buffers
+        self._extractor = ResponseIdExtractor() if response_buffers is not None else None
+        self._preroll: list[bytes] = []
+        self._buffer: Optional[ResponseBuffer] = None
+        self._headers: dict[str, str] = {}
+        self._status = 0
+        self._sent_headers = False
+        self._finished = False
+
+    async def send_headers(self, status: int, headers: dict[str, str]) -> None:
+        if self._sent_headers:
+            return
+        self._sent_headers = True
+        self._status = status
+        self._headers = _filter_response_headers(headers)
+        await self._send({
+            "type": FRAME_RESPONSE_HEADERS,
+            "request_id": self._request_id,
+            "status": self._status,
+            "headers": self._headers,
+        })
+
+    async def send_chunk(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        if not self._sent_headers:
+            await self.send_headers(200, {})
+        await self._send({
+            "type": FRAME_RESPONSE_CHUNK,
+            "request_id": self._request_id,
+            "data": base64.b64encode(chunk).decode("ascii"),
+        })
+        self._append_buffer(chunk)
+
+    async def finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if not self._sent_headers:
+            await self.send_headers(204, {})
+        if self._buffer is not None:
+            self._buffer.finalize()
+        await self._send({"type": FRAME_RESPONSE_END, "request_id": self._request_id})
+
+    def abandon(self) -> None:
+        _abandon_buffer(self._buffer, self._response_buffers)
+        self._buffer = None
+
+    def _append_buffer(self, chunk: bytes) -> None:
+        if self._extractor is None:
+            return
+        if self._buffer is not None:
+            self._buffer.append(chunk)
+            return
+        rid = self._extractor.feed(chunk)
+        if rid is None:
+            self._preroll.append(chunk)
+            return
+        assert self._response_buffers is not None
+        self._buffer = self._response_buffers.create(rid, self._status, self._headers)
+        for prev in self._preroll:
+            self._buffer.append(prev)
+        self._preroll.clear()
+        self._buffer.append(chunk)
 
 
 _DROP_REQUEST_HEADERS = {
