@@ -902,7 +902,7 @@ class InProcessAgentRunner:
         return await _write_json(writer, 200, {"id": response_id, "object": "response", "deleted": True})
 
     async def _create_run(self, req: _ParsedRequest, writer: StreamWriter, api: Any) -> int:
-        if len(self._run_streams) >= _MAX_CONCURRENT_RUNS:
+        if self._active_run_count() >= _MAX_CONCURRENT_RUNS:
             return await _write_json(
                 writer,
                 429,
@@ -1231,6 +1231,9 @@ class InProcessAgentRunner:
         self._run_statuses[run_id] = current
         return current
 
+    def _active_run_count(self) -> int:
+        return sum(1 for task in self._active_run_tasks.values() if not task.done())
+
     def _ensure_sweeper(self) -> None:
         if self._sweep_task is None or self._sweep_task.done():
             self._sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
@@ -1238,17 +1241,22 @@ class InProcessAgentRunner:
     async def _sweep_orphaned_runs(self) -> None:
         while True:
             await asyncio.sleep(60)
-            now = time.time()
-            for run_id, created_at in list(self._run_streams_created.items()):
-                if now - created_at > _RUN_STREAM_TTL:
-                    self._run_streams.pop(run_id, None)
-                    self._run_streams_created.pop(run_id, None)
-                    self._active_run_agents.pop(run_id, None)
-                    self._active_run_tasks.pop(run_id, None)
-                    self._run_approval_sessions.pop(run_id, None)
-            for run_id, status in list(self._run_statuses.items()):
-                if status.get("status") in {"completed", "failed", "cancelled"} and now - float(status.get("updated_at", 0) or 0) > _RUN_STATUS_TTL:
-                    self._run_statuses.pop(run_id, None)
+            self._sweep_orphaned_runs_once(time.time())
+
+    def _sweep_orphaned_runs_once(self, now: float) -> None:
+        for run_id, created_at in list(self._run_streams_created.items()):
+            if now - created_at > _RUN_STREAM_TTL:
+                task = self._active_run_tasks.get(run_id)
+                if task is not None and not task.done():
+                    continue
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
+                self._active_run_agents.pop(run_id, None)
+                self._active_run_tasks.pop(run_id, None)
+                self._run_approval_sessions.pop(run_id, None)
+        for run_id, status in list(self._run_statuses.items()):
+            if status.get("status") in {"completed", "failed", "cancelled"} and now - float(status.get("updated_at", 0) or 0) > _RUN_STATUS_TTL:
+                self._run_statuses.pop(run_id, None)
 
     def _normalize_chat_content(self, content: Any) -> str:
         fn = getattr(self._api_module, "_normalize_chat_content", None)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -83,6 +84,16 @@ class FakeAPI:
             {"role": "user", "content": user_message},
             {"role": "assistant", "content": final_response},
         ]
+
+
+class BlockingAPI(FakeAPI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def _run_agent(self, **kwargs):
+        await self.release.wait()
+        return await super()._run_agent(**kwargs)
 
 
 async def _dispatch(runner, method, path, body=None, headers=None):
@@ -171,3 +182,47 @@ async def test_run_create_status_and_events():
     assert b"run.completed" in events.body
     assert status.status == 200
     assert json.loads(status.body)["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_completed_poll_only_runs_do_not_exhaust_active_run_limit():
+    runner = InProcessAgentRunner(api_adapter=FakeAPI())
+
+    for _ in range(10):
+        created = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"})
+        assert created.status == 202
+
+    for _ in range(50):
+        if runner._active_run_count() == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert runner._active_run_count() == 0
+    assert len(runner._run_streams) == 10
+
+    created = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"})
+
+    assert created.status == 202
+
+
+@pytest.mark.asyncio
+async def test_sweeper_does_not_drop_active_run_handles_by_age():
+    api = BlockingAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    created = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"})
+    run_id = json.loads(created.body)["run_id"]
+
+    for _ in range(50):
+        if runner._active_run_count() == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert runner._active_run_count() == 1
+    runner._run_streams_created[run_id] = 0.0
+
+    runner._sweep_orphaned_runs_once(now=1_000.0)
+
+    assert run_id in runner._run_streams
+    assert run_id in runner._active_run_tasks
+    assert run_id in runner._run_approval_sessions
+
+    stopped = await _dispatch(runner, "POST", f"/v1/runs/{run_id}/stop", {})
+    assert stopped.status == 200
