@@ -348,6 +348,40 @@ async def test_responses_store_false_string_does_not_persist():
 
 
 @pytest.mark.asyncio
+async def test_responses_store_null_preserves_default_persistence():
+    api = FakeAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+
+    writer = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "store": None})
+
+    assert writer.status == 200
+    assert api._response_store.responses
+
+
+@pytest.mark.asyncio
+async def test_responses_store_unknown_string_preserves_default_persistence():
+    api = FakeAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+
+    writer = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "store": "bogus"})
+
+    assert writer.status == 200
+    assert api._response_store.responses
+
+
+@pytest.mark.asyncio
+async def test_responses_malformed_stream_flag_uses_non_streaming_default():
+    api = FakeAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+
+    writer = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "stream": {"value": True}})
+
+    assert writer.status == 200
+    assert writer.headers["Content-Type"] == "application/json"
+    assert json.loads(writer.body)["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_responses_idempotency_key_does_not_cache_different_input():
     api = CountingAPI()
     runner = InProcessAgentRunner(api_adapter=api)
@@ -571,6 +605,32 @@ async def test_run_create_status_and_events():
     assert b"run.completed" in events.body
     assert status.status == 200
     assert json.loads(status.body)["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_runs_idempotency_key_returns_cached_run_for_same_body():
+    runner = InProcessAgentRunner(api_adapter=FakeAPI())
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"}, headers=headers)
+    second = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"}, headers=headers)
+
+    assert first.status == 202
+    assert second.status == 202
+    assert json.loads(second.body)["run_id"] == json.loads(first.body)["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_runs_idempotency_key_different_body_allocates_new_run():
+    runner = InProcessAgentRunner(api_adapter=FakeAPI())
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"}, headers=headers)
+    second = await _dispatch(runner, "POST", "/v1/runs", {"input": "different"}, headers=headers)
+
+    assert first.status == 202
+    assert second.status == 202
+    assert json.loads(second.body)["run_id"] != json.loads(first.body)["run_id"]
 
 
 @pytest.mark.asyncio

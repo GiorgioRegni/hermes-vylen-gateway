@@ -69,6 +69,13 @@ class _CachedResponse:
     created_at: float
 
 
+@dataclass
+class _CachedRun:
+    fingerprint: str
+    run_id: str
+    created_at: float
+
+
 class _RequestError(Exception):
     def __init__(
         self,
@@ -135,10 +142,9 @@ class InProcessAgentRunner:
         self._active_run_tasks: dict[str, asyncio.Task[Any]] = {}
         self._run_statuses: dict[str, dict[str, Any]] = {}
         self._run_approval_sessions: dict[str, str] = {}
-        # Idempotency-Key → (run_id, created_at). Lets clients retry POST
-        # /v1/runs without spawning duplicate agents; mirrors the dedupe
-        # behavior the old HTTP relay inherited from Hermes's API server.
-        self._idempotency_keys: dict[str, tuple[str, float]] = {}
+        # Idempotency-Key → run cache. Fingerprinting prevents a reused key
+        # from replaying an unrelated prompt/session.
+        self._idempotency_keys: dict[str, _CachedRun] = {}
         self._response_idempotency_keys: dict[str, _CachedResponse] = {}
         self._response_idempotency_inflight: dict[
             tuple[str, str],
@@ -363,7 +369,7 @@ class InProcessAgentRunner:
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model = str(body.get("model") or getattr(api, "_model_name", "hermes-agent"))
         created = int(time.time())
-        if _coerce_stream_flag(body.get("stream", False)):
+        if _coerce_request_bool(body.get("stream"), default=False):
             return await self._stream_chat(
                 writer,
                 api,
@@ -551,7 +557,7 @@ class InProcessAgentRunner:
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
-        store = _coerce_stream_flag(body.get("store", True))
+        store = _coerce_request_bool(body.get("store"), default=True)
         if conversation and previous_response_id:
             raise _RequestError(400, "Cannot use both 'conversation' and 'previous_response_id'")
         if conversation:
@@ -592,7 +598,7 @@ class InProcessAgentRunner:
         session_id = stored_session_id or str(uuid.uuid4())
         gateway_session_key = _parse_session_key(req)
         model = str(body.get("model") or getattr(api, "_model_name", "hermes-agent"))
-        if _coerce_stream_flag(body.get("stream", False)):
+        if _coerce_request_bool(body.get("stream"), default=False):
             return await self._stream_response(
                 writer,
                 api,
@@ -1011,25 +1017,30 @@ class InProcessAgentRunner:
 
     async def _create_run(self, req: _ParsedRequest, writer: StreamWriter, api: Any) -> int:
         idempotency_key = _parse_idempotency_key(req)
+        body = req.json_body()
         if idempotency_key is not None:
+            fingerprint = _make_request_fingerprint(body)
             cached = self._idempotency_keys.get(idempotency_key)
             if cached is not None:
-                cached_run_id, cached_at = cached
-                if time.time() - cached_at <= _IDEMPOTENCY_TTL and cached_run_id in self._run_statuses:
+                if (
+                    time.time() - cached.created_at <= _IDEMPOTENCY_TTL
+                    and cached.fingerprint == fingerprint
+                    and cached.run_id in self._run_statuses
+                ):
                     return await _write_json(
                         writer,
                         202,
-                        {"run_id": cached_run_id, "status": "started"},
+                        {"run_id": cached.run_id, "status": "started"},
                     )
                 # Stale or evicted; drop and fall through to a fresh allocation.
-                self._idempotency_keys.pop(idempotency_key, None)
+                if time.time() - cached.created_at > _IDEMPOTENCY_TTL:
+                    self._idempotency_keys.pop(idempotency_key, None)
         if self._active_run_count() >= _MAX_CONCURRENT_RUNS:
             return await _write_json(
                 writer,
                 429,
                 _openai_error(f"Too many concurrent runs (max {_MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
             )
-        body = req.json_body()
         raw_input = body.get("input")
         if not raw_input:
             raise _RequestError(400, "Missing 'input' field")
@@ -1053,7 +1064,11 @@ class InProcessAgentRunner:
                 stored_session_id = stored.get("session_id")
         run_id = f"run_{uuid.uuid4().hex}"
         if idempotency_key is not None:
-            self._idempotency_keys[idempotency_key] = (run_id, time.time())
+            self._idempotency_keys[idempotency_key] = _CachedRun(
+                fingerprint=_make_request_fingerprint(body),
+                run_id=run_id,
+                created_at=time.time(),
+            )
         session_id = body.get("session_id") or stored_session_id or run_id
         gateway_session_key = _parse_session_key(req)
         approval_session_key = gateway_session_key or session_id or run_id
@@ -1380,8 +1395,8 @@ class InProcessAgentRunner:
         for run_id, status in list(self._run_statuses.items()):
             if status.get("status") in {"completed", "failed", "cancelled"} and now - float(status.get("updated_at", 0) or 0) > _RUN_STATUS_TTL:
                 self._run_statuses.pop(run_id, None)
-        for key, (_, created_at) in list(self._idempotency_keys.items()):
-            if now - created_at > _IDEMPOTENCY_TTL:
+        for key, cached in list(self._idempotency_keys.items()):
+            if now - cached.created_at > _IDEMPOTENCY_TTL:
                 self._idempotency_keys.pop(key, None)
         for key, cached in list(self._response_idempotency_keys.items()):
             if now - cached.created_at > _IDEMPOTENCY_TTL:
@@ -1440,18 +1455,24 @@ def _make_request_fingerprint(body: dict[str, Any]) -> str:
     return sha256(fingerprint_body.encode("utf-8")).hexdigest()
 
 
-def _coerce_stream_flag(value: Any) -> bool:
-    # OpenAI-compatible clients sometimes send `stream` as a JSON string
-    # ("true"/"false") or numeric scalar. Treat the obvious falsy strings
-    # and zeros as False so callers asking for non-streaming JSON aren't
-    # silently upgraded to SSE.
+def _coerce_request_bool(value: Any, *, default: bool = False) -> bool:
+    # OpenAI-compatible clients sometimes send booleans as JSON strings
+    # ("true"/"false") or numeric scalars. Unknown shapes fall back to the
+    # caller's endpoint-specific default instead of using Python truthiness.
     if isinstance(value, bool):
         return value
+    if value is None:
+        return default
     if isinstance(value, (int, float)):
         return value != 0
     if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes", "on"}
-    return bool(value)
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        return default
+    return default
 
 
 def _parse_session_key(req: _ParsedRequest) -> str | None:
