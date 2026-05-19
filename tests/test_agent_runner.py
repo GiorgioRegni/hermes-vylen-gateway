@@ -96,6 +96,29 @@ class BlockingAPI(FakeAPI):
         return await super()._run_agent(**kwargs)
 
 
+class CountingAPI(FakeAPI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def _run_agent(self, **kwargs):
+        self.calls += 1
+        return await super()._run_agent(**kwargs)
+
+
+class BlockingCountingAPI(CountingAPI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _run_agent(self, **kwargs):
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return await FakeAPI._run_agent(self, **kwargs)
+
+
 class CancellableAPI(FakeAPI):
     def __init__(self) -> None:
         super().__init__()
@@ -165,6 +188,52 @@ async def test_responses_stream_persists_and_emits_sse():
     assert b"event: response.output_text.delta" in writer.body
     assert b"event: response.completed" in writer.body
     assert api._response_store.responses
+
+
+@pytest.mark.asyncio
+async def test_responses_idempotency_key_returns_cached_response():
+    api = CountingAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+    second = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+
+    first_payload = json.loads(first.body)
+    second_payload = json.loads(second.body)
+    assert first.status == 200
+    assert second.status == 200
+    assert second_payload["id"] == first_payload["id"]
+    assert api.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_idempotency_retry_survives_cancelled_first_request():
+    api = BlockingCountingAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+    writer = CaptureWriter()
+    first = asyncio.create_task(
+        runner.dispatch(
+            "POST",
+            "/v1/responses",
+            headers,
+            json.dumps({"input": "hi"}).encode("utf-8"),
+            writer,
+        )
+    )
+    await asyncio.wait_for(api.started.wait(), timeout=1.0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    api.release.set()
+    retry = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+
+    assert retry.status == 200
+    assert json.loads(retry.body)["status"] == "completed"
+    assert api.calls == 1
 
 
 @pytest.mark.asyncio

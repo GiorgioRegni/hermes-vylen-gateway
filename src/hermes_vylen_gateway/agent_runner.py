@@ -132,6 +132,10 @@ class InProcessAgentRunner:
         # /v1/runs without spawning duplicate agents; mirrors the dedupe
         # behavior the old HTTP relay inherited from Hermes's API server.
         self._idempotency_keys: dict[str, tuple[str, float]] = {}
+        self._response_idempotency_keys: dict[
+            str,
+            tuple[asyncio.Future[tuple[dict[str, Any], dict[str, str]]], float],
+        ] = {}
         self._sweep_task: asyncio.Task[Any] | None = None
 
     def ensure_api(self) -> Any:
@@ -573,42 +577,67 @@ class InProcessAgentRunner:
                 gateway_session_key,
             )
 
-        result, usage = await api._run_agent(
-            user_message=user_message,
-            conversation_history=conversation_history,
-            ephemeral_system_prompt=instructions,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-        )
-        final = result.get("final_response", "") or result.get("error", "(No response generated)")
-        response_id = f"resp_{uuid.uuid4().hex[:28]}"
-        created_at = int(time.time())
-        output_start = api._response_messages_turn_start_index(conversation_history, user_message, result)
-        output_items = api._extract_output_items(result, start_index=output_start)
-        response_data = {
-            "id": response_id,
-            "object": "response",
-            "status": "completed",
-            "created_at": created_at,
-            "model": model,
-            "output": output_items,
-            "usage": _response_usage(usage),
-        }
-        if store:
-            full_history = api._build_response_conversation_history(
-                conversation_history, user_message, result, final
-            )
-            api._response_store.put(response_id, {
-                "response": response_data,
-                "conversation_history": full_history,
-                "instructions": instructions,
-                "session_id": session_id,
-            })
-            if conversation:
-                api._response_store.set_conversation(conversation, response_id)
+        idempotency_key = _parse_idempotency_key(req)
         response_headers = {"X-Hermes-Session-Id": session_id}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
+
+        async def build_response() -> tuple[dict[str, Any], dict[str, str]]:
+            result, usage = await api._run_agent(
+                user_message=user_message,
+                conversation_history=conversation_history,
+                ephemeral_system_prompt=instructions,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+            final = result.get("final_response", "") or result.get("error", "(No response generated)")
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            created_at = int(time.time())
+            output_start = api._response_messages_turn_start_index(conversation_history, user_message, result)
+            output_items = api._extract_output_items(result, start_index=output_start)
+            response_data = {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "created_at": created_at,
+                "model": model,
+                "output": output_items,
+                "usage": _response_usage(usage),
+            }
+            if store:
+                full_history = api._build_response_conversation_history(
+                    conversation_history, user_message, result, final
+                )
+                api._response_store.put(response_id, {
+                    "response": response_data,
+                    "conversation_history": full_history,
+                    "instructions": instructions,
+                    "session_id": session_id,
+                })
+                if conversation:
+                    api._response_store.set_conversation(conversation, response_id)
+            return response_data, response_headers
+
+        response_task: asyncio.Future[tuple[dict[str, Any], dict[str, str]]] | None = None
+        if idempotency_key is not None:
+            cached = self._response_idempotency_keys.get(idempotency_key)
+            if cached is not None:
+                cached_future, cached_at = cached
+                if time.time() - cached_at <= _IDEMPOTENCY_TTL:
+                    cached_response, cached_headers = await asyncio.shield(cached_future)
+                    return await _write_json(writer, 200, cached_response, cached_headers)
+                self._response_idempotency_keys.pop(idempotency_key, None)
+            response_task = asyncio.create_task(build_response())
+            self._response_idempotency_keys[idempotency_key] = (response_task, time.time())
+        else:
+            response_data, response_headers = await build_response()
+            return await _write_json(writer, 200, response_data, response_headers)
+        try:
+            response_data, response_headers = await asyncio.shield(response_task)
+        except Exception:
+            if idempotency_key is not None:
+                self._response_idempotency_keys.pop(idempotency_key, None)
+            raise
         return await _write_json(writer, 200, response_data, response_headers)
 
     async def _stream_response(
@@ -1289,6 +1318,9 @@ class InProcessAgentRunner:
         for key, (_, created_at) in list(self._idempotency_keys.items()):
             if now - created_at > _IDEMPOTENCY_TTL:
                 self._idempotency_keys.pop(key, None)
+        for key, (_, created_at) in list(self._response_idempotency_keys.items()):
+            if now - created_at > _IDEMPOTENCY_TTL:
+                self._response_idempotency_keys.pop(key, None)
 
     def _normalize_chat_content(self, content: Any) -> str:
         fn = getattr(self._api_module, "_normalize_chat_content", None)
