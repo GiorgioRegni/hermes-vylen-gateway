@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -103,7 +104,11 @@ class CountingAPI(FakeAPI):
 
     async def _run_agent(self, **kwargs):
         self.calls += 1
-        return await super()._run_agent(**kwargs)
+        result, usage = await super()._run_agent(**kwargs)
+        final_response = f"hello: {kwargs.get('user_message')}"
+        result["final_response"] = final_response
+        result["messages"] = [{"role": "assistant", "content": final_response}]
+        return result, usage
 
 
 class BlockingCountingAPI(CountingAPI):
@@ -134,6 +139,19 @@ class CancellableAPI(FakeAPI):
             raise
 
 
+class FailingOnceAPI(CountingAPI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    async def _run_agent(self, **kwargs):
+        self.calls += 1
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("boom")
+        return await FakeAPI._run_agent(self, **kwargs)
+
+
 async def _dispatch(runner, method, path, body=None, headers=None):
     writer = CaptureWriter()
     await runner.dispatch(
@@ -144,6 +162,10 @@ async def _dispatch(runner, method, path, body=None, headers=None):
         writer,
     )
     return writer
+
+
+def _output_text(payload):
+    return payload["output"][0]["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -208,6 +230,64 @@ async def test_responses_idempotency_key_returns_cached_response():
 
 
 @pytest.mark.asyncio
+async def test_responses_idempotency_key_does_not_cache_different_input():
+    api = CountingAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+    second = await _dispatch(runner, "POST", "/v1/responses", {"input": "different"}, headers=headers)
+
+    first_payload = json.loads(first.body)
+    second_payload = json.loads(second.body)
+    assert first.status == 200
+    assert second.status == 200
+    assert second_payload["id"] != first_payload["id"]
+    assert _output_text(second_payload) == "hello: different"
+    assert api.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_responses_idempotency_key_does_not_cache_different_fingerprint_field():
+    api = CountingAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "model": "a"}, headers=headers)
+    second = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "model": "b"}, headers=headers)
+
+    first_payload = json.loads(first.body)
+    second_payload = json.loads(second.body)
+    assert first.status == 200
+    assert second.status == 200
+    assert second_payload["id"] != first_payload["id"]
+    assert api.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_responses_idempotency_same_key_different_inflight_fingerprints_run_separately():
+    api = BlockingCountingAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = asyncio.create_task(_dispatch(runner, "POST", "/v1/responses", {"input": "first"}, headers=headers))
+    second = asyncio.create_task(_dispatch(runner, "POST", "/v1/responses", {"input": "second"}, headers=headers))
+    for _ in range(50):
+        if api.calls == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert api.calls == 2
+
+    api.release.set()
+    first_writer, second_writer = await asyncio.gather(first, second)
+
+    first_payload = json.loads(first_writer.body)
+    second_payload = json.loads(second_writer.body)
+    assert _output_text(first_payload) == "hello: first"
+    assert _output_text(second_payload) == "hello: second"
+
+
+@pytest.mark.asyncio
 async def test_responses_idempotency_retry_survives_cancelled_first_request():
     api = BlockingCountingAPI()
     runner = InProcessAgentRunner(api_adapter=api)
@@ -234,6 +314,51 @@ async def test_responses_idempotency_retry_survives_cancelled_first_request():
     assert retry.status == 200
     assert json.loads(retry.body)["status"] == "completed"
     assert api.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_idempotency_cache_expires():
+    api = CountingAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+    first_payload = json.loads(first.body)
+    runner._sweep_orphaned_runs_once(now=time.time() + 4_000.0)
+    second = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+
+    second_payload = json.loads(second.body)
+    assert second_payload["id"] != first_payload["id"]
+    assert api.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_responses_idempotency_key_failure_is_not_cached():
+    api = FailingOnceAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    with pytest.raises(RuntimeError):
+        await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+    retry = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+
+    assert retry.status == 200
+    assert api.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_responses_rejects_invalid_idempotency_key():
+    runner = InProcessAgentRunner(api_adapter=FakeAPI())
+    writer = await _dispatch(
+        runner,
+        "POST",
+        "/v1/responses",
+        {"input": "hi"},
+        headers={"Content-Type": "application/json", "Idempotency-Key": "bad\nkey"},
+    )
+
+    assert writer.status == 400
+    assert json.loads(writer.body)["error"]["message"] == "Invalid Idempotency-Key"
 
 
 @pytest.mark.asyncio

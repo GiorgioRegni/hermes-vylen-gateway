@@ -62,6 +62,13 @@ class _ParsedRequest:
         return parsed
 
 
+@dataclass
+class _CachedResponse:
+    fingerprint: str
+    response: tuple[dict[str, Any], dict[str, str]]
+    created_at: float
+
+
 class _RequestError(Exception):
     def __init__(
         self,
@@ -132,9 +139,10 @@ class InProcessAgentRunner:
         # /v1/runs without spawning duplicate agents; mirrors the dedupe
         # behavior the old HTTP relay inherited from Hermes's API server.
         self._idempotency_keys: dict[str, tuple[str, float]] = {}
-        self._response_idempotency_keys: dict[
-            str,
-            tuple[asyncio.Future[tuple[dict[str, Any], dict[str, str]]], float],
+        self._response_idempotency_keys: dict[str, _CachedResponse] = {}
+        self._response_idempotency_inflight: dict[
+            tuple[str, str],
+            asyncio.Task[tuple[dict[str, Any], dict[str, str]]],
         ] = {}
         self._sweep_task: asyncio.Task[Any] | None = None
 
@@ -618,25 +626,48 @@ class InProcessAgentRunner:
                     api._response_store.set_conversation(conversation, response_id)
             return response_data, response_headers
 
-        response_task: asyncio.Future[tuple[dict[str, Any], dict[str, str]]] | None = None
         if idempotency_key is not None:
+            fingerprint = _make_request_fingerprint(
+                body,
+                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+            )
             cached = self._response_idempotency_keys.get(idempotency_key)
             if cached is not None:
-                cached_future, cached_at = cached
-                if time.time() - cached_at <= _IDEMPOTENCY_TTL:
-                    cached_response, cached_headers = await asyncio.shield(cached_future)
+                if (
+                    time.time() - cached.created_at <= _IDEMPOTENCY_TTL
+                    and cached.fingerprint == fingerprint
+                ):
+                    cached_response, cached_headers = cached.response
                     return await _write_json(writer, 200, cached_response, cached_headers)
-                self._response_idempotency_keys.pop(idempotency_key, None)
-            response_task = asyncio.create_task(build_response())
-            self._response_idempotency_keys[idempotency_key] = (response_task, time.time())
+                if time.time() - cached.created_at > _IDEMPOTENCY_TTL:
+                    self._response_idempotency_keys.pop(idempotency_key, None)
+
+            inflight_key = (idempotency_key, fingerprint)
+            response_task = self._response_idempotency_inflight.get(inflight_key)
+            if response_task is None:
+                async def build_and_cache() -> tuple[dict[str, Any], dict[str, str]]:
+                    response = await build_response()
+                    self._response_idempotency_keys[idempotency_key] = _CachedResponse(
+                        fingerprint=fingerprint,
+                        response=response,
+                        created_at=time.time(),
+                    )
+                    return response
+
+                response_task = asyncio.create_task(build_and_cache())
+                self._response_idempotency_inflight[inflight_key] = response_task
+
+                def clear_inflight(done_task: asyncio.Task[tuple[dict[str, Any], dict[str, str]]]) -> None:
+                    if self._response_idempotency_inflight.get(inflight_key) is done_task:
+                        self._response_idempotency_inflight.pop(inflight_key, None)
+
+                response_task.add_done_callback(clear_inflight)
         else:
             response_data, response_headers = await build_response()
             return await _write_json(writer, 200, response_data, response_headers)
         try:
             response_data, response_headers = await asyncio.shield(response_task)
         except Exception:
-            if idempotency_key is not None:
-                self._response_idempotency_keys.pop(idempotency_key, None)
             raise
         return await _write_json(writer, 200, response_data, response_headers)
 
@@ -1318,8 +1349,8 @@ class InProcessAgentRunner:
         for key, (_, created_at) in list(self._idempotency_keys.items()):
             if now - created_at > _IDEMPOTENCY_TTL:
                 self._idempotency_keys.pop(key, None)
-        for key, (_, created_at) in list(self._response_idempotency_keys.items()):
-            if now - created_at > _IDEMPOTENCY_TTL:
+        for key, cached in list(self._response_idempotency_keys.items()):
+            if now - cached.created_at > _IDEMPOTENCY_TTL:
                 self._response_idempotency_keys.pop(key, None)
 
     def _normalize_chat_content(self, content: Any) -> str:
@@ -1366,6 +1397,13 @@ def _parse_idempotency_key(req: _ParsedRequest) -> str | None:
     if len(raw) > _MAX_IDEMPOTENCY_KEY_LEN:
         raise _RequestError(400, "Idempotency-Key too long")
     return raw
+
+
+def _make_request_fingerprint(body: dict[str, Any], keys: list[str]) -> str:
+    from hashlib import sha256
+
+    subset = {key: body.get(key) for key in keys}
+    return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
 def _coerce_stream_flag(value: Any) -> bool:
