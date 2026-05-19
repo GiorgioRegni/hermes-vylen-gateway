@@ -345,7 +345,7 @@ class InProcessAgentRunner:
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model = str(body.get("model") or getattr(api, "_model_name", "hermes-agent"))
         created = int(time.time())
-        if body.get("stream", False):
+        if _coerce_stream_flag(body.get("stream", False)):
             return await self._stream_chat(
                 writer,
                 api,
@@ -553,7 +553,7 @@ class InProcessAgentRunner:
         session_id = stored_session_id or str(uuid.uuid4())
         gateway_session_key = _parse_session_key(req)
         model = str(body.get("model") or getattr(api, "_model_name", "hermes-agent"))
-        if body.get("stream", False):
+        if _coerce_stream_flag(body.get("stream", False)):
             return await self._stream_response(
                 writer,
                 api,
@@ -1299,6 +1299,20 @@ class InProcessAgentRunner:
         if not message:
             code, message = "invalid_content_part", raw
         return _RequestError(400, message, code=code, param=param)
+
+
+def _coerce_stream_flag(value: Any) -> bool:
+    # OpenAI-compatible clients sometimes send `stream` as a JSON string
+    # ("true"/"false") or numeric scalar. Treat the obvious falsy strings
+    # and zeros as False so callers asking for non-streaming JSON aren't
+    # silently upgraded to SSE.
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
 
 
 def _parse_session_key(req: _ParsedRequest) -> str | None:
