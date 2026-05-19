@@ -381,6 +381,8 @@ class _FrameStreamWriter:
         self._progress.mark()
 
     def abandon(self) -> None:
+        if self._finished:
+            return
         _abandon_buffer(self._buffer, self._response_buffers)
         self._buffer = None
 
