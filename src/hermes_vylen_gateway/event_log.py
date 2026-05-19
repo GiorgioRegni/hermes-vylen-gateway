@@ -113,7 +113,10 @@ class RetainedEventLog:
         after_seq: int,
         *,
         keepalive_seconds: float | None = None,
+        reject_future_cursor: bool = False,
     ) -> AsyncIterator[RetainedEvent]:
+        if reject_future_cursor and after_seq > self.latest_seq:
+            raise ResumeExpired(self.floor_seq, self.latest_seq)
         cursor = after_seq
         while True:
             version = self._version

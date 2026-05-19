@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from hermes_vylen_gateway.agent_runner import InProcessAgentRunner
+from hermes_vylen_gateway.agent_runner import _RUN_STREAM_TTL, InProcessAgentRunner
 
 
 class CaptureWriter:
@@ -770,6 +770,31 @@ async def test_sweeper_does_not_drop_active_run_handles_by_age():
 
     stopped = await _dispatch(runner, "POST", f"/v1/runs/{run_id}/stop", {})
     assert stopped.status == 200
+
+
+@pytest.mark.asyncio
+async def test_run_event_sweep_retains_terminal_events_from_close_time():
+    runner = InProcessAgentRunner(api_adapter=FakeAPI())
+    created = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"})
+    run_id = json.loads(created.body)["run_id"]
+
+    for _ in range(50):
+        if runner._active_run_count() == 0:
+            break
+        await asyncio.sleep(0.01)
+    event_log = runner._run_event_logs.get(run_id)
+    assert event_log is not None
+    event_log.created_at = 0.0
+    event_log.updated_at = 1_000.0
+
+    runner._sweep_orphaned_runs_once(now=1_000.0 + _RUN_STREAM_TTL - 1)
+
+    assert runner._run_event_logs.get(run_id) is event_log
+    assert any(event.kind == "run.completed" for event in event_log.events)
+
+    runner._sweep_orphaned_runs_once(now=1_000.0 + _RUN_STREAM_TTL + 1)
+
+    assert runner._run_event_logs.get(run_id) is None
 
 
 @pytest.mark.asyncio

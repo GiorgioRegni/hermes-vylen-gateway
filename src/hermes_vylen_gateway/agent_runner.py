@@ -1402,7 +1402,7 @@ class InProcessAgentRunner:
 
     def _sweep_orphaned_runs_once(self, now: float) -> None:
         for run_id, event_log in list(self._run_event_logs._logs.items()):
-            if now - event_log.created_at > _RUN_STREAM_TTL:
+            if now - event_log.updated_at > _RUN_STREAM_TTL:
                 task = self._active_run_tasks.get(run_id)
                 if task is not None and not task.done():
                     continue

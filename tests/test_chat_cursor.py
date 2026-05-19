@@ -107,3 +107,72 @@ async def test_chat_subscribe_reports_expired_cursor_when_retention_floor_advanc
         "floor_seq": 1,
         "latest_seq": 2,
     }]
+
+
+@pytest.mark.asyncio
+async def test_same_request_resubscribe_old_task_does_not_pop_new_task():
+    first_send_started = asyncio.Event()
+    sent: list[dict] = []
+
+    async def send(frame: dict) -> None:
+        sent.append(frame)
+        if frame.get("chat_id") == "chat_a" and frame.get("type") == FRAME_CHAT_EVENT:
+            first_send_started.set()
+            await asyncio.Event().wait()
+
+    relay = ChatCursorRelay(send, EventLogRegistry())
+    relay.append_push({"type": "push", "chat_id": "chat_a", "text": "old"})
+    relay.append_push({"type": "push", "chat_id": "chat_b", "text": "new"})
+
+    await relay.handle_subscribe({
+        "type": "chat_subscribe",
+        "request_id": "req_reused",
+        "chat_id": "chat_a",
+        "client_id": "client_phone",
+        "after_seq": 0,
+    })
+    await asyncio.wait_for(first_send_started.wait(), timeout=1.0)
+
+    await relay.handle_subscribe({
+        "type": "chat_subscribe",
+        "request_id": "req_reused",
+        "chat_id": "chat_b",
+        "client_id": "client_phone",
+        "after_seq": 0,
+    })
+    await asyncio.sleep(0)
+
+    assert "req_reused" in relay._tasks
+    assert any(
+        frame.get("type") == FRAME_CHAT_EVENT and frame.get("chat_id") == "chat_b"
+        for frame in sent
+    )
+
+    await relay.close()
+
+
+@pytest.mark.asyncio
+async def test_send_push_retains_only_after_gateway_send_succeeds():
+    sent: list[dict] = []
+    fail = True
+
+    async def send(frame: dict) -> None:
+        nonlocal fail
+        if fail:
+            fail = False
+            raise RuntimeError("socket closed")
+        sent.append(dict(frame))
+
+    logs = EventLogRegistry()
+    relay = ChatCursorRelay(send, logs)
+
+    with pytest.raises(RuntimeError, match="socket closed"):
+        await relay.send_push({"type": "push", "chat_id": "chat_a", "text": "lost"})
+    assert logs.get("chat_a") is None
+
+    seq = await relay.send_push({"type": "push", "chat_id": "chat_a", "text": "kept"})
+
+    assert seq == 1
+    assert sent == [{"type": "push", "chat_id": "chat_a", "text": "kept", "seq": 1}]
+    assert [event.seq for event in logs.get("chat_a").events] == [1]
+    assert logs.get("chat_a").events[0].payload["seq"] == 1

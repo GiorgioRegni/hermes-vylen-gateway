@@ -44,11 +44,9 @@ def _env_float(name: str, default: float) -> float:
 
 
 async def _sweep_loop(
-    registry: ResponseBufferRegistry, interval_seconds: float
+    registry: Any, interval_seconds: float, *, label: str = "registry"
 ) -> None:
-    """Periodically drop completed/expired response buffers so a long-lived
-    gateway session doesn't accumulate state proportional to streamed
-    response volume. Cancelled on session teardown."""
+    """Periodically drop completed/expired in-memory gateway state."""
     if interval_seconds <= 0:
         return
     while True:
@@ -59,9 +57,9 @@ async def _sweep_loop(
         try:
             evicted = registry.sweep()
             if evicted:
-                logger.debug("response buffer sweep: evicted=%d", evicted)
+                logger.debug("%s sweep: evicted=%d", label, evicted)
         except Exception:  # noqa: BLE001
-            logger.exception("response buffer sweep failed")
+            logger.exception("%s sweep failed", label)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -143,7 +141,8 @@ def make_adapter_class():
             # from the current session anyway.
             self._blobs: BlobRegistry | None = None
             self._response_buffers: ResponseBufferRegistry | None = None
-            self._sweep_task: asyncio.Task | None = None
+            self._response_sweep_task: asyncio.Task | None = None
+            self._chat_sweep_task: asyncio.Task | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
@@ -232,8 +231,12 @@ def make_adapter_class():
                 max_bytes=_env_int("VYLEN_RESUME_MAX_BYTES", 4 * 1024 * 1024),
             )
             sweep_interval = _env_float("VYLEN_RESUME_SWEEP_SECONDS", 60.0)
-            self._sweep_task = asyncio.create_task(
-                _sweep_loop(self._response_buffers, sweep_interval)
+            self._response_sweep_task = asyncio.create_task(
+                _sweep_loop(self._response_buffers, sweep_interval, label="response buffer")
+            )
+            chat_sweep_interval = _env_float("VYLEN_CHAT_CURSOR_SWEEP_SECONDS", 60.0)
+            self._chat_sweep_task = asyncio.create_task(
+                _sweep_loop(self._chat_event_logs, chat_sweep_interval, label="chat event log")
             )
             self._relay = HermesRelay(
                 client.send,
@@ -256,13 +259,20 @@ def make_adapter_class():
             return True
 
         async def _teardown_session(self) -> None:
-            if self._sweep_task:
-                self._sweep_task.cancel()
+            if self._response_sweep_task:
+                self._response_sweep_task.cancel()
                 try:
-                    await self._sweep_task
+                    await self._response_sweep_task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
-                self._sweep_task = None
+                self._response_sweep_task = None
+            if self._chat_sweep_task:
+                self._chat_sweep_task.cancel()
+                try:
+                    await self._chat_sweep_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                self._chat_sweep_task = None
             if self._memory:
                 await self._memory.close()
                 self._memory = None
@@ -315,10 +325,9 @@ def make_adapter_class():
                 frame["cron_job_name"] = cron_job_name
             try:
                 if self._chat_cursors is not None:
-                    seq = self._chat_cursors.append_push(frame)
-                    if seq is not None:
-                        frame["seq"] = seq
-                await self._client.send(frame)
+                    await self._chat_cursors.send_push(frame)
+                else:
+                    await self._client.send(frame)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("vylen gateway: push frame send failed: %s", exc)
                 return SendResult(success=False, error=str(exc), retryable=True)
@@ -378,10 +387,9 @@ def make_adapter_class():
                 frame["cron_job_name"] = cron_job_name
             try:
                 if self._chat_cursors is not None:
-                    seq = self._chat_cursors.append_push(frame)
-                    if seq is not None:
-                        frame["seq"] = seq
-                await self._client.send(frame)
+                    await self._chat_cursors.send_push(frame)
+                else:
+                    await self._client.send(frame)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("vylen gateway: image push frame send failed: %s", exc)
                 return SendResult(success=False, error=str(exc), retryable=True)

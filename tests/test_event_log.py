@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from hermes_vylen_gateway.adapter import _sweep_loop
 from hermes_vylen_gateway.event_log import EventLogRegistry, ResumeExpired, RetainedEventLog
 
 
@@ -61,6 +62,31 @@ def test_ttl_eviction_expires_old_cursor():
         log.replay_after(0)
 
 
+@pytest.mark.asyncio
+async def test_future_cursor_expires_on_fresh_log_when_requested():
+    log = RetainedEventLog("chat_a")
+
+    with pytest.raises(ResumeExpired) as exc:
+        async for _ in log.tail_after(184, reject_future_cursor=True):
+            pass
+
+    assert exc.value.floor_seq == 0
+    assert exc.value.latest_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_future_cursor_expires_on_active_log_when_requested():
+    log = RetainedEventLog("chat_a")
+    log.append("event", {"n": 1})
+
+    with pytest.raises(ResumeExpired) as exc:
+        async for _ in log.tail_after(184, reject_future_cursor=True):
+            pass
+
+    assert exc.value.floor_seq == 0
+    assert exc.value.latest_seq == 1
+
+
 def test_byte_eviction_bounds_retained_payloads():
     log = RetainedEventLog("chat_a", max_bytes=70)
     log.append("event", {"text": "a" * 30})
@@ -68,6 +94,39 @@ def test_byte_eviction_bounds_retained_payloads():
 
     assert [event.seq for event in log.events] == [2]
     assert log.total_bytes <= 70
+
+
+def test_registry_sweep_drops_expired_empty_logs_and_cursors():
+    clock = Clock()
+    registry = EventLogRegistry(ttl_seconds=5, now=clock)
+    log = registry.get_or_create("chat_a")
+    event = log.append("event", {"n": 1})
+    registry.acknowledge("chat_a", "client_phone", event.seq)
+
+    clock.advance(6)
+    assert registry.sweep() == 1
+
+    assert registry.get("chat_a") is None
+    assert registry.cursor("chat_a", "client_phone") == 0
+
+
+@pytest.mark.asyncio
+async def test_adapter_sweep_loop_uses_event_log_registry_sweep():
+    clock = Clock()
+    registry = EventLogRegistry(ttl_seconds=1, now=clock)
+    registry.get_or_create("chat_a").append("event", {"n": 1})
+    clock.advance(2)
+
+    task = asyncio.create_task(_sweep_loop(registry, interval_seconds=0.01, label="chat event log"))
+    try:
+        for _ in range(50):
+            if registry.get("chat_a") is None:
+                break
+            await asyncio.sleep(0.01)
+        assert registry.get("chat_a") is None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

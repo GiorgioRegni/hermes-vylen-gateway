@@ -28,6 +28,7 @@ class ChatCursorRelay:
         self._logs = logs
         self._disabled = disabled
         self._tasks: dict[str, asyncio.Task[Any]] = {}
+        self._push_lock = asyncio.Lock()
 
     def append_push(self, frame: dict[str, Any]) -> int | None:
         if self._disabled:
@@ -37,6 +38,28 @@ class ChatCursorRelay:
             return None
         event = self._logs.get_or_create(chat_id).append("push", dict(frame))
         return event.seq
+
+    async def send_push(self, frame: dict[str, Any]) -> int | None:
+        if self._disabled:
+            await self._send(frame)
+            return None
+        chat_id = _clean_id(str(frame.get("chat_id") or ""))
+        if not chat_id:
+            await self._send(frame)
+            return None
+        async with self._push_lock:
+            existing_log = self._logs.get(chat_id)
+            log = existing_log or self._logs.get_or_create(chat_id)
+            seq = log.next_seq
+            frame["seq"] = seq
+            try:
+                await self._send(frame)
+            except Exception:
+                if existing_log is None and not log.events:
+                    self._logs.drop(chat_id)
+                raise
+            event = log.append("push", dict(frame))
+            return event.seq
 
     async def handle_subscribe(self, frame: dict[str, Any]) -> None:
         request_id = _clean_id(str(frame.get("request_id") or ""))
@@ -87,7 +110,11 @@ class ChatCursorRelay:
     async def _tail(self, request_id: str, chat_id: str, client_id: str, after_seq: int) -> None:
         log = self._logs.get_or_create(chat_id)
         try:
-            async for event in log.tail_after(after_seq, keepalive_seconds=None):
+            async for event in log.tail_after(
+                after_seq,
+                keepalive_seconds=None,
+                reject_future_cursor=True,
+            ):
                 await self._send({
                     "type": FRAME_CHAT_EVENT,
                     "request_id": request_id,
@@ -111,7 +138,9 @@ class ChatCursorRelay:
         except asyncio.CancelledError:
             raise
         finally:
-            self._tasks.pop(request_id, None)
+            current = asyncio.current_task()
+            if self._tasks.get(request_id) is current:
+                self._tasks.pop(request_id, None)
 
 
 def _clean_id(value: str) -> str:
