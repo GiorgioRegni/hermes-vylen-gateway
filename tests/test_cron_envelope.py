@@ -4,7 +4,7 @@ UI sees the LLM's actual output and gets job_id/name as structured
 metadata. Tracked upstream-ask: get this as a metadata dict instead.
 """
 
-from hermes_vylen_gateway.adapter import _parse_cron_envelope
+from hermes_vylen_gateway.adapter import VYLEN_INBOX_CHAT_ID, _parse_cron_envelope, _push_cursor_chat_id
 
 
 def test_envelope_with_footer():
@@ -73,3 +73,9 @@ def test_partial_envelope_passes_through():
     assert body == raw
     assert job_id == ""
     assert name == ""
+
+
+def test_push_cursor_chat_id_uses_vylen_inbox_bucket():
+    assert _push_cursor_chat_id("custom_home") == VYLEN_INBOX_CHAT_ID
+    assert _push_cursor_chat_id("") == VYLEN_INBOX_CHAT_ID
+    assert _push_cursor_chat_id(None) == VYLEN_INBOX_CHAT_ID

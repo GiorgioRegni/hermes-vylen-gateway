@@ -31,6 +31,8 @@ from .transcribe import FRAME_TRANSCRIBE, Transcriber
 
 logger = logging.getLogger(__name__)
 
+VYLEN_INBOX_CHAT_ID = "inbox"
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
@@ -316,7 +318,7 @@ def make_adapter_class():
             body, cron_job_id, cron_job_name = _parse_cron_envelope(raw)
             frame: dict[str, Any] = {
                 "type": "push",
-                "chat_id": str(chat_id) if chat_id is not None else "",
+                "chat_id": _push_cursor_chat_id(chat_id),
                 "text": body,
             }
             if cron_job_id:
@@ -375,7 +377,7 @@ def make_adapter_class():
             body, cron_job_id, cron_job_name = _parse_cron_envelope(raw_caption)
             frame: dict[str, Any] = {
                 "type": "push",
-                "chat_id": str(chat_id) if chat_id is not None else "",
+                "chat_id": _push_cursor_chat_id(chat_id),
                 "text": body,
                 "image_token": token,
                 "image_mime": mime,
@@ -413,6 +415,12 @@ def _parse_cron_envelope(text: str) -> tuple[str, str, str]:
         return text, "", ""
     body = match.group("body").strip()
     return body, match.group("job_id").strip(), match.group("name").strip()
+
+
+def _push_cursor_chat_id(chat_id: Any) -> str:
+    # Vylen currently renders every plugin-initiated push in one synthetic
+    # notifications inbox, and the app subscribes to that single cursor stream.
+    return VYLEN_INBOX_CHAT_ID
 
 
 def adapter_factory(config):
