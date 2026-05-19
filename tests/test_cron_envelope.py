@@ -1,10 +1,19 @@
-"""Unit tests for the cron-envelope parser. The plugin's `send()` strips
+"""Unit tests for the Vylen gateway adapter's lightweight helpers.
+
+The plugin's `send()` strips
 Hermes's `Cronjob Response: …\\n(job_id: …)\\n---\\n…` chrome so the Vylen
 UI sees the LLM's actual output and gets job_id/name as structured
 metadata. Tracked upstream-ask: get this as a metadata dict instead.
 """
 
-from hermes_vylen_gateway.adapter import VYLEN_INBOX_CHAT_ID, _parse_cron_envelope, _push_cursor_chat_id
+import asyncio
+
+import hermes_vylen_gateway.adapter as adapter_mod
+from hermes_vylen_gateway.adapter import (
+    VYLEN_INBOX_CHAT_ID,
+    _parse_cron_envelope,
+    _push_cursor_chat_id,
+)
 
 
 def test_envelope_with_footer():
@@ -79,3 +88,32 @@ def test_push_cursor_chat_id_uses_vylen_inbox_bucket():
     assert _push_cursor_chat_id("custom_home") == VYLEN_INBOX_CHAT_ID
     assert _push_cursor_chat_id("") == VYLEN_INBOX_CHAT_ID
     assert _push_cursor_chat_id(None) == VYLEN_INBOX_CHAT_ID
+
+
+def test_adapter_keeps_blob_registry_across_socket_teardown(monkeypatch):
+    class FakeBasePlatformAdapter:
+        def __init__(self, config, platform):
+            self.config = config
+            self.platform = platform
+
+    class FakePlatform:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeClient:
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        adapter_mod,
+        "_import_hermes",
+        lambda: (FakeBasePlatformAdapter, FakePlatform),
+    )
+    adapter_cls = adapter_mod.make_adapter_class()
+    adapter = adapter_cls(config={})
+    blobs = adapter._blobs
+    adapter._client = FakeClient()
+
+    asyncio.run(adapter._teardown_session())
+
+    assert adapter._blobs is blobs

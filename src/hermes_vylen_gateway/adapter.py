@@ -138,10 +138,10 @@ def make_adapter_class():
                 max_bytes=_env_int("VYLEN_CHAT_CURSOR_MAX_BYTES", 4 * 1024 * 1024),
             )
             # One blob registry per adapter lifetime; entries auto-expire
-            # (see blobs.py). Resets implicitly across reconnects since the
-            # adapter is reconstructed and the cloud only references tokens
-            # from the current session anyway.
-            self._blobs: BlobRegistry | None = None
+            # (see blobs.py). Chat cursor logs also live for the adapter
+            # lifetime, so replayed image pushes must keep resolving tokens
+            # across gateway socket reconnects.
+            self._blobs = BlobRegistry()
             self._response_buffers: ResponseBufferRegistry | None = None
             self._response_sweep_task: asyncio.Task | None = None
             self._chat_sweep_task: asyncio.Task | None = None
@@ -227,7 +227,6 @@ def make_adapter_class():
                 return False
             self._client = client
             self._instance_id = ready.instance_id
-            self._blobs = BlobRegistry()
             self._response_buffers = ResponseBufferRegistry(
                 grace_seconds=_env_float("VYLEN_RESUME_GRACE_SECONDS", 300.0),
                 max_bytes=_env_int("VYLEN_RESUME_MAX_BYTES", 4 * 1024 * 1024),
@@ -290,10 +289,6 @@ def make_adapter_class():
             if self._chat_cursors:
                 await self._chat_cursors.close()
                 self._chat_cursors = None
-            # BlobRegistry holds no OS resources (just an in-memory map);
-            # drop the reference so any outstanding tokens immediately
-            # become unaddressable across reconnects.
-            self._blobs = None
             self._response_buffers = None
             if self._client:
                 await self._client.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import re
 import uuid
 from typing import Any, Awaitable, Callable
@@ -123,6 +124,7 @@ class ChatCursorRelay:
                     "request_id": request_id,
                     "chat_id": chat_id,
                     "seq": event.seq,
+                    "occurred_at": _iso_time(event.created_at),
                     "event": {
                         "kind": event.kind,
                         "payload": event.payload,
@@ -162,3 +164,7 @@ def _parse_seq(value: Any) -> int:
 
 def _event_id() -> str:
     return f"evt_{uuid.uuid4().hex}"
+
+
+def _iso_time(epoch_seconds: float) -> str:
+    return datetime.fromtimestamp(epoch_seconds, timezone.utc).isoformat().replace("+00:00", "Z")

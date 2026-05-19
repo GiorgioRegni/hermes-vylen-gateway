@@ -52,6 +52,34 @@ async def test_chat_subscribe_replays_after_client_cursor_and_tracks_per_client(
 
 
 @pytest.mark.asyncio
+async def test_chat_event_replay_uses_retained_event_time():
+    clock = Clock()
+    sent: list[dict] = []
+
+    async def send(frame: dict) -> None:
+        sent.append(frame)
+
+    relay = ChatCursorRelay(send, EventLogRegistry(now=clock))
+    relay.append_push({"type": "push", "chat_id": "chat_a", "text": "one"})
+    clock.advance(10)
+    relay.append_push({"type": "push", "chat_id": "chat_a", "text": "two"})
+
+    await relay.handle_subscribe({
+        "type": "chat_subscribe",
+        "request_id": "req_phone",
+        "chat_id": "chat_a",
+        "client_id": "client_phone",
+        "after_seq": 1,
+    })
+    await asyncio.sleep(0)
+
+    events = [frame for frame in sent if frame["type"] == FRAME_CHAT_EVENT]
+    assert events[0]["occurred_at"] == "1970-01-01T00:16:50Z"
+
+    await relay.close()
+
+
+@pytest.mark.asyncio
 async def test_two_chat_subscribers_receive_live_push_without_consuming_each_other():
     sent: list[dict] = []
 
