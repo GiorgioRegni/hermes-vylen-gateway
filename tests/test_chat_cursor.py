@@ -184,9 +184,28 @@ async def test_send_push_retains_only_after_gateway_send_succeeds():
     seq = await relay.send_push({"type": "push", "chat_id": "chat_a", "text": "kept"})
 
     assert seq == 1
-    assert sent == [{"type": "push", "chat_id": "chat_a", "text": "kept", "seq": 1}]
+    assert len(sent) == 1
+    assert sent[0] == {
+        "type": "push",
+        "chat_id": "chat_a",
+        "text": "kept",
+        "seq": 1,
+        "event_id": sent[0]["event_id"],
+    }
+    assert sent[0]["event_id"].startswith("evt_")
     assert [event.seq for event in logs.get("chat_a").events] == [1]
     assert logs.get("chat_a").events[0].payload["seq"] == 1
+    assert logs.get("chat_a").events[0].payload["event_id"] == sent[0]["event_id"]
+
+
+def test_append_push_adds_restart_stable_event_id_to_retained_payload():
+    relay = ChatCursorRelay(lambda _: None, EventLogRegistry())
+
+    seq = relay.append_push({"type": "push", "chat_id": "chat_a", "text": "kept"})
+
+    assert seq == 1
+    event = relay._logs.get("chat_a").events[0]
+    assert event.payload["event_id"].startswith("evt_")
 
 
 @pytest.mark.asyncio

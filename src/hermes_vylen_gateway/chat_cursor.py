@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import uuid
 from typing import Any, Awaitable, Callable
 
 from .event_log import EventLogRegistry, ResumeExpired
@@ -36,6 +37,7 @@ class ChatCursorRelay:
         chat_id = _clean_id(str(frame.get("chat_id") or ""))
         if not chat_id:
             return None
+        frame.setdefault("event_id", _event_id())
         event = self._logs.get_or_create(chat_id).append("push", dict(frame))
         return event.seq
 
@@ -52,6 +54,7 @@ class ChatCursorRelay:
             log = existing_log or self._logs.get_or_create(chat_id)
             seq = log.next_seq
             frame["seq"] = seq
+            frame.setdefault("event_id", _event_id())
             try:
                 await self._send(frame)
             except Exception:
@@ -155,3 +158,7 @@ def _parse_seq(value: Any) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+def _event_id() -> str:
+    return f"evt_{uuid.uuid4().hex}"
