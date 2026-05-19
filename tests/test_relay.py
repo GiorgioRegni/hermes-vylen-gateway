@@ -12,6 +12,7 @@ from hermes_vylen_gateway.relay import (
     FRAME_REQUEST,
     FRAME_RESPONSE_CHUNK,
     FRAME_RESPONSE_END,
+    FRAME_RESPONSE_ERROR,
     FRAME_RESPONSE_HEADERS,
     HermesRelay,
 )
@@ -114,6 +115,87 @@ async def test_relay_emits_response_error_when_dispatch_crashes(monkeypatch):
     assert err["type"] == "response_error"
     assert err["request_id"] == "req_x"
     assert err["code"] == "RELAY_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_relay_timeout_resets_on_stream_progress(monkeypatch):
+    async def fake_dispatch(method, path, headers, body, writer):
+        await writer.send_headers(200, {"Content-Type": "text/event-stream"})
+        await asyncio.sleep(0.03)
+        await writer.send_chunk(
+            b'event: response.created\ndata: {"response":{"id":"resp_slow"}}\n\n'
+        )
+        await asyncio.sleep(0.03)
+        await writer.send_chunk(
+            b'event: response.output_text.delta\ndata: {"delta":"still working"}\n\n'
+        )
+        await asyncio.sleep(0.03)
+        await writer.finish()
+        return 200
+
+    monkeypatch.setattr(agent_runner, "dispatch", fake_dispatch)
+    sent_frames: list[dict] = []
+    sent_event = asyncio.Event()
+
+    async def send(frame):
+        sent_frames.append(frame)
+        if frame["type"] in {FRAME_RESPONSE_ERROR, FRAME_RESPONSE_END}:
+            sent_event.set()
+
+    relay = HermesRelay(send, request_timeout=0.05)
+    try:
+        await relay.handle({
+            "type": FRAME_REQUEST,
+            "request_id": "req_slow_stream",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": {"Content-Type": "application/json"},
+            "body": base64.b64encode(b'{"input":"hi","stream":true}').decode(),
+            "stream": True,
+        })
+        await asyncio.wait_for(sent_event.wait(), timeout=1.0)
+    finally:
+        await relay.close()
+
+    assert sent_frames[-1]["type"] == FRAME_RESPONSE_END
+    assert not any(f["type"] == FRAME_RESPONSE_ERROR for f in sent_frames)
+
+
+@pytest.mark.asyncio
+async def test_relay_timeout_still_fires_without_progress(monkeypatch):
+    async def fake_dispatch(method, path, headers, body, writer):
+        await asyncio.sleep(0.1)
+        await writer.finish()
+        return 200
+
+    monkeypatch.setattr(agent_runner, "dispatch", fake_dispatch)
+    sent_frames: list[dict] = []
+    sent_event = asyncio.Event()
+
+    async def send(frame):
+        sent_frames.append(frame)
+        if frame["type"] in {FRAME_RESPONSE_ERROR, FRAME_RESPONSE_END}:
+            sent_event.set()
+
+    relay = HermesRelay(send, request_timeout=0.02)
+    try:
+        await relay.handle({
+            "type": FRAME_REQUEST,
+            "request_id": "req_stalled",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": {"Content-Type": "application/json"},
+            "body": base64.b64encode(b'{"input":"hi","stream":true}').decode(),
+            "stream": True,
+        })
+        await asyncio.wait_for(sent_event.wait(), timeout=1.0)
+    finally:
+        await relay.close()
+
+    err = sent_frames[-1]
+    assert err["type"] == FRAME_RESPONSE_ERROR
+    assert err["request_id"] == "req_stalled"
+    assert err["code"] == "HERMES_TIMEOUT"
 
 
 @pytest.mark.asyncio

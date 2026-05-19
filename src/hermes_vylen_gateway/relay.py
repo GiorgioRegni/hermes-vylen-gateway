@@ -156,7 +156,11 @@ class HermesRelay:
             if self._request_timeout is None:
                 await coro
             else:
-                await asyncio.wait_for(coro, timeout=self._request_timeout)
+                await _await_with_progress_timeout(
+                    coro,
+                    writer.progress,
+                    timeout=self._request_timeout,
+                )
         except asyncio.TimeoutError:
             writer.abandon()
             logger.warning("relay timeout for %s %s", method, path)
@@ -332,6 +336,11 @@ class _FrameStreamWriter:
         self._status = 0
         self._sent_headers = False
         self._finished = False
+        self._progress = _ProgressTracker()
+
+    @property
+    def progress(self) -> "_ProgressTracker":
+        return self._progress
 
     async def send_headers(self, status: int, headers: dict[str, str]) -> None:
         if self._sent_headers:
@@ -345,6 +354,7 @@ class _FrameStreamWriter:
             "status": self._status,
             "headers": self._headers,
         })
+        self._progress.mark()
 
     async def send_chunk(self, chunk: bytes) -> None:
         if not chunk:
@@ -356,6 +366,7 @@ class _FrameStreamWriter:
             "request_id": self._request_id,
             "data": base64.b64encode(chunk).decode("ascii"),
         })
+        self._progress.mark()
         self._append_buffer(chunk)
 
     async def finish(self) -> None:
@@ -367,6 +378,7 @@ class _FrameStreamWriter:
         if self._buffer is not None:
             self._buffer.finalize()
         await self._send({"type": FRAME_RESPONSE_END, "request_id": self._request_id})
+        self._progress.mark()
 
     def abandon(self) -> None:
         _abandon_buffer(self._buffer, self._response_buffers)
@@ -388,6 +400,69 @@ class _FrameStreamWriter:
             self._buffer.append(prev)
         self._preroll.clear()
         self._buffer.append(chunk)
+
+
+class _ProgressTracker:
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+        self._version = 0
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def mark(self) -> None:
+        self._version += 1
+        self._event.set()
+
+    async def wait_for_change(self, last_seen: int) -> int:
+        while self._version == last_seen:
+            self._event.clear()
+            if self._version != last_seen:
+                break
+            await self._event.wait()
+        return self._version
+
+
+async def _await_with_progress_timeout(
+    coro: Awaitable[int],
+    progress: _ProgressTracker,
+    *,
+    timeout: float,
+) -> int:
+    task = asyncio.create_task(coro)
+    last_seen = progress.version
+    progress_task: asyncio.Task[int] | None = None
+    try:
+        while True:
+            if task.done():
+                return await task
+            progress_task = asyncio.create_task(progress.wait_for_change(last_seen))
+            done, _pending = await asyncio.wait(
+                {task, progress_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task in done:
+                progress_task.cancel()
+                return await task
+            if progress_task in done:
+                last_seen = progress_task.result()
+                progress_task = None
+                continue
+            progress_task.cancel()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            raise asyncio.TimeoutError
+    except BaseException:
+        if progress_task is not None:
+            progress_task.cancel()
+        if not task.done():
+            task.cancel()
+        raise
 
 
 _DROP_REQUEST_HEADERS = {
