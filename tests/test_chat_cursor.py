@@ -12,6 +12,17 @@ from hermes_vylen_gateway.chat_cursor import (
 from hermes_vylen_gateway.event_log import EventLogRegistry
 
 
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 @pytest.mark.asyncio
 async def test_chat_subscribe_replays_after_client_cursor_and_tracks_per_client():
     sent: list[dict] = []
@@ -176,3 +187,42 @@ async def test_send_push_retains_only_after_gateway_send_succeeds():
     assert sent == [{"type": "push", "chat_id": "chat_a", "text": "kept", "seq": 1}]
     assert [event.seq for event in logs.get("chat_a").events] == [1]
     assert logs.get("chat_a").events[0].payload["seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_active_quiet_subscription_keeps_log_attached_through_sweep():
+    clock = Clock()
+    logs = EventLogRegistry(ttl_seconds=1, now=clock)
+    sent: list[dict] = []
+
+    async def send(frame: dict) -> None:
+        sent.append(dict(frame))
+
+    relay = ChatCursorRelay(send, logs)
+    await relay.handle_subscribe({
+        "type": "chat_subscribe",
+        "request_id": "req_phone",
+        "chat_id": "inbox",
+        "client_id": "client_phone",
+        "after_seq": 0,
+    })
+    await asyncio.sleep(0)
+
+    log = logs.get("inbox")
+    assert log is not None
+    assert log.active_tailers == 1
+
+    clock.advance(2)
+    assert logs.sweep() == 0
+    assert logs.get("inbox") is log
+
+    relay.append_push({"type": "push", "chat_id": "inbox", "text": "still live"})
+    await asyncio.sleep(0)
+
+    assert [
+        frame["event"]["payload"]["text"]
+        for frame in sent
+        if frame.get("type") == FRAME_CHAT_EVENT
+    ] == ["still live"]
+
+    await relay.close()

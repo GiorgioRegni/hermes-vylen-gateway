@@ -53,6 +53,7 @@ class RetainedEventLog:
         self._closed = False
         self._progressed = asyncio.Event()
         self._version = 0
+        self._tailers = 0
 
     @property
     def events(self) -> tuple[RetainedEvent, ...]:
@@ -79,6 +80,10 @@ class RetainedEventLog:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def active_tailers(self) -> int:
+        return self._tailers
 
     def append(self, kind: str, payload: Any, *, now: float | None = None) -> RetainedEvent:
         ts = float(self._now() if now is None else now)
@@ -115,25 +120,29 @@ class RetainedEventLog:
         keepalive_seconds: float | None = None,
         reject_future_cursor: bool = False,
     ) -> AsyncIterator[RetainedEvent]:
-        if reject_future_cursor and after_seq > self.latest_seq:
-            raise ResumeExpired(self.floor_seq, self.latest_seq)
-        cursor = after_seq
-        while True:
-            version = self._version
-            for event in self.replay_after(cursor):
-                cursor = event.seq
-                yield event
-            if self._closed and cursor >= self.latest_seq:
-                return
-            self._progressed.clear()
-            if self._version == version:
-                try:
-                    if keepalive_seconds is None:
-                        await self._progressed.wait()
-                    else:
-                        await asyncio.wait_for(self._progressed.wait(), timeout=keepalive_seconds)
-                except asyncio.TimeoutError:
-                    continue
+        self._tailers += 1
+        try:
+            if reject_future_cursor and after_seq > self.latest_seq:
+                raise ResumeExpired(self.floor_seq, self.latest_seq)
+            cursor = after_seq
+            while True:
+                version = self._version
+                for event in self.replay_after(cursor):
+                    cursor = event.seq
+                    yield event
+                if self._closed and cursor >= self.latest_seq:
+                    return
+                self._progressed.clear()
+                if self._version == version:
+                    try:
+                        if keepalive_seconds is None:
+                            await self._progressed.wait()
+                        else:
+                            await asyncio.wait_for(self._progressed.wait(), timeout=keepalive_seconds)
+                    except asyncio.TimeoutError:
+                        continue
+        finally:
+            self._tailers -= 1
 
     def _evict(self, *, now: float | None = None) -> None:
         ts = float(self._now() if now is None else now)
@@ -204,6 +213,8 @@ class EventLogRegistry:
         dropped: list[str] = []
         for key, log in self._logs.items():
             log._evict(now=ts)
+            if log.active_tailers > 0:
+                continue
             inactive_for = ts - log.updated_at
             if not log.events and inactive_for > self.ttl_seconds:
                 dropped.append(key)
