@@ -361,13 +361,13 @@ class _FrameStreamWriter:
             return
         if not self._sent_headers:
             await self.send_headers(200, {})
+        self._append_buffer(chunk)
         await self._send({
             "type": FRAME_RESPONSE_CHUNK,
             "request_id": self._request_id,
             "data": base64.b64encode(chunk).decode("ascii"),
         })
         self._progress.mark()
-        self._append_buffer(chunk)
 
     async def finish(self) -> None:
         if self._finished:
