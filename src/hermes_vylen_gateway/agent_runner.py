@@ -384,6 +384,15 @@ class InProcessAgentRunner:
             session_id=session_id,
             gateway_session_key=gateway_session_key,
         )
+        if isinstance(result, dict) and result.get("failed"):
+            return await _write_json(
+                writer,
+                500,
+                _openai_error(
+                    str(result.get("error") or "agent run failed"),
+                    err_type="server_error",
+                ),
+            )
         final = result.get("final_response") or ""
         response_headers = {"X-Hermes-Session-Id": result.get("session_id", session_id)}
         if gateway_session_key:
@@ -906,7 +915,9 @@ class InProcessAgentRunner:
             agent_error: str | None = None
             try:
                 result, usage = await task
-                if result.get("final_response") and not final_parts:
+                if result.get("failed"):
+                    agent_error = str(result.get("error") or "agent run failed")
+                elif result.get("final_response") and not final_parts:
                     await emit_delta(str(result["final_response"]))
             except Exception as exc:  # noqa: BLE001
                 agent_error = str(exc)

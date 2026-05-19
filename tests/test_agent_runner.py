@@ -229,6 +229,41 @@ async def test_responses_stream_persists_and_emits_sse():
 
 
 @pytest.mark.asyncio
+async def test_stream_response_failed_result_emits_failed_event():
+    api = FailedResultAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    writer = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "stream": True})
+
+    assert writer.status == 200
+    assert b"event: response.failed" in writer.body
+    assert b"event: response.completed" not in writer.body
+    stored = next(iter(api._response_store.responses.values()))
+    assert stored["response"]["status"] == "failed"
+    assert stored["response"]["error"] == {"message": "provider auth failed", "type": "server_error"}
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_failed_result_returns_error():
+    runner = InProcessAgentRunner(api_adapter=FailedResultAPI())
+
+    writer = await _dispatch(
+        runner,
+        "POST",
+        "/v1/chat/completions",
+        {"messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    payload = json.loads(writer.body)
+    assert writer.status == 500
+    assert payload["error"] == {
+        "message": "provider auth failed",
+        "type": "server_error",
+        "param": None,
+        "code": None,
+    }
+
+
+@pytest.mark.asyncio
 async def test_responses_idempotency_key_returns_cached_response():
     api = CountingAPI()
     runner = InProcessAgentRunner(api_adapter=api)
