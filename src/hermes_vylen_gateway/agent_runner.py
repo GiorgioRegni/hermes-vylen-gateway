@@ -601,21 +601,35 @@ class InProcessAgentRunner:
             final = result.get("final_response", "") or result.get("error", "(No response generated)")
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
             created_at = int(time.time())
-            output_start = api._response_messages_turn_start_index(conversation_history, user_message, result)
-            output_items = api._extract_output_items(result, start_index=output_start)
+            failed = bool(isinstance(result, dict) and result.get("failed"))
+            if failed:
+                output_items = [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": str(final)}],
+                }]
+            else:
+                output_start = api._response_messages_turn_start_index(conversation_history, user_message, result)
+                output_items = api._extract_output_items(result, start_index=output_start)
             response_data = {
                 "id": response_id,
                 "object": "response",
-                "status": "completed",
+                "status": "failed" if failed else "completed",
                 "created_at": created_at,
                 "model": model,
                 "output": output_items,
                 "usage": _response_usage(usage),
             }
+            if failed:
+                response_data["error"] = {"message": str(final), "type": "server_error"}
             if store:
-                full_history = api._build_response_conversation_history(
-                    conversation_history, user_message, result, final
-                )
+                if failed:
+                    full_history = list(conversation_history)
+                    full_history.append({"role": "user", "content": user_message})
+                else:
+                    full_history = api._build_response_conversation_history(
+                        conversation_history, user_message, result, final
+                    )
                 api._response_store.put(response_id, {
                     "response": response_data,
                     "conversation_history": full_history,

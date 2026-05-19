@@ -156,6 +156,18 @@ class FailingOnceAPI(CountingAPI):
         return await FakeAPI._run_agent(self, **kwargs)
 
 
+class FailedResultAPI(CountingAPI):
+    async def _run_agent(self, **kwargs):
+        self.calls += 1
+        return {
+            "failed": True,
+            "final_response": None,
+            "error": "provider auth failed",
+            "messages": [],
+            "session_id": kwargs.get("session_id") or "sid",
+        }, {"input_tokens": 4, "output_tokens": 0, "total_tokens": 4}
+
+
 async def _dispatch(runner, method, path, body=None, headers=None):
     writer = CaptureWriter()
     await runner.dispatch(
@@ -348,6 +360,39 @@ async def test_responses_idempotency_key_failure_is_not_cached():
 
     assert retry.status == 200
     assert api.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_responses_failed_result_returns_and_stores_failed_response():
+    api = FailedResultAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+
+    writer = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"})
+
+    payload = json.loads(writer.body)
+    assert writer.status == 200
+    assert payload["status"] == "failed"
+    assert payload["error"] == {"message": "provider auth failed", "type": "server_error"}
+    assert _output_text(payload) == "provider auth failed"
+    stored = api._response_store.get(payload["id"])
+    assert stored["response"] == payload
+    assert stored["conversation_history"] == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_responses_failed_result_is_idempotently_replayed():
+    api = FailedResultAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+    second = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi"}, headers=headers)
+
+    first_payload = json.loads(first.body)
+    second_payload = json.loads(second.body)
+    assert second_payload == first_payload
+    assert second_payload["status"] == "failed"
+    assert api.calls == 1
 
 
 @pytest.mark.asyncio
