@@ -17,6 +17,9 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
+from urllib.parse import parse_qs, urlsplit
+
+from .event_log import EventLogRegistry, ResumeExpired, RetainedEventLog
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,8 @@ _CHAT_KEEPALIVE_SECONDS = 30.0
 _RUN_STREAM_TTL = 300
 _RUN_STATUS_TTL = 3600
 _MAX_CONCURRENT_RUNS = 10
+_RUN_STREAM_MAX_EVENTS = 1000
+_RUN_STREAM_MAX_BYTES = 4 * 1024 * 1024
 _MAX_SESSION_HEADER_LEN = 256
 _MAX_IDEMPOTENCY_KEY_LEN = 256
 _IDEMPOTENCY_TTL = _RUN_STATUS_TTL
@@ -136,8 +141,11 @@ class InProcessAgentRunner:
         self._api = api_adapter
         self._api_module = api_module
         self._init_error: Exception | None = None
-        self._run_streams: dict[str, asyncio.Queue[dict[str, Any] | None]] = {}
-        self._run_streams_created: dict[str, float] = {}
+        self._run_event_logs = EventLogRegistry(
+            ttl_seconds=_RUN_STREAM_TTL,
+            max_events=_RUN_STREAM_MAX_EVENTS,
+            max_bytes=_RUN_STREAM_MAX_BYTES,
+        )
         self._active_run_agents: dict[str, Any] = {}
         self._active_run_tasks: dict[str, asyncio.Task[Any]] = {}
         self._run_statuses: dict[str, dict[str, Any]] = {}
@@ -197,7 +205,7 @@ class InProcessAgentRunner:
         return status
 
     async def _dispatch(self, req: _ParsedRequest, writer: StreamWriter) -> int:
-        path = req.path.split("?", 1)[0]
+        path = urlsplit(req.path).path
         if req.method == "GET" and path in {"/health", "/v1/health"}:
             return await _write_json(writer, 200, {"status": "ok", "platform": "hermes-agent"})
         if req.method == "GET" and path == "/health/detailed":
@@ -229,7 +237,7 @@ class InProcessAgentRunner:
                 if req.method == "GET" and suffix == "":
                     return await self._get_run(writer, run_id)
                 if req.method == "GET" and suffix == "events":
-                    return await self._run_events(writer, run_id)
+                    return await self._run_events(req, writer, run_id)
                 if req.method == "POST" and suffix == "stop":
                     return await self._stop_run(writer, run_id)
                 if req.method == "POST" and suffix == "approval":
@@ -1073,10 +1081,8 @@ class InProcessAgentRunner:
         session_id = body.get("session_id") or stored_session_id or run_id
         gateway_session_key = _parse_session_key(req)
         approval_session_key = gateway_session_key or session_id or run_id
-        q: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         created_at = time.time()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = created_at
+        event_log = self._run_event_logs.get_or_create(run_id)
         self._run_approval_sessions[run_id] = approval_session_key
         self._set_run_status(
             run_id,
@@ -1089,10 +1095,19 @@ class InProcessAgentRunner:
 
         loop = asyncio.get_running_loop()
 
+        def append_run_event(kind: str, payload: dict[str, Any]) -> None:
+            try:
+                if asyncio.get_running_loop() is loop:
+                    event_log.append(kind, payload)
+                    return
+            except RuntimeError:
+                pass
+            loop.call_soon_threadsafe(event_log.append, kind, payload)
+
         def text_cb(delta: Any) -> None:
             if delta is None:
                 return
-            loop.call_soon_threadsafe(q.put_nowait, {
+            append_run_event("message.delta", {
                 "event": "message.delta",
                 "run_id": run_id,
                 "timestamp": time.time(),
@@ -1107,7 +1122,7 @@ class InProcessAgentRunner:
                 "tool": tool_name,
                 "preview": preview,
             }
-            loop.call_soon_threadsafe(q.put_nowait, event)
+            append_run_event(event_type, event)
 
         async def run_and_close() -> None:
             try:
@@ -1116,7 +1131,7 @@ class InProcessAgentRunner:
                     result, usage = await self._run_agent_for_run(
                         api=api,
                         run_id=run_id,
-                        q=q,
+                        event_log=event_log,
                         user_message=user_message,
                         conversation_history=conversation_history,
                         instructions=body.get("instructions"),
@@ -1138,11 +1153,11 @@ class InProcessAgentRunner:
                     )
                 if isinstance(result, dict) and result.get("failed"):
                     error_msg = result.get("error") or "agent run failed"
-                    await q.put({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": error_msg})
+                    event_log.append("run.failed", {"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": error_msg})
                     self._set_run_status(run_id, "failed", error=error_msg, last_event="run.failed")
                 else:
                     output = result.get("final_response", "") if isinstance(result, dict) else ""
-                    await q.put({
+                    event_log.append("run.completed", {
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -1152,14 +1167,14 @@ class InProcessAgentRunner:
                     self._set_run_status(run_id, "completed", output=output, usage=_response_usage(usage), last_event="run.completed")
             except asyncio.CancelledError:
                 self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
-                await q.put({"event": "run.cancelled", "run_id": run_id, "timestamp": time.time()})
+                event_log.append("run.cancelled", {"event": "run.cancelled", "run_id": run_id, "timestamp": time.time()})
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("run %s failed", run_id)
                 self._set_run_status(run_id, "failed", error=str(exc), last_event="run.failed")
-                await q.put({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": str(exc)})
+                event_log.append("run.failed", {"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": str(exc)})
             finally:
-                await q.put(None)
+                event_log.close()
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
@@ -1174,7 +1189,7 @@ class InProcessAgentRunner:
         *,
         api: Any,
         run_id: str,
-        q: asyncio.Queue[dict[str, Any] | None],
+        event_log: RetainedEventLog,
         user_message: Any,
         conversation_history: list[dict[str, Any]],
         instructions: str | None,
@@ -1207,7 +1222,7 @@ class InProcessAgentRunner:
                 "waiting_for_approval",
                 last_event="approval.request",
             )
-            loop.call_soon_threadsafe(q.put_nowait, event)
+            loop.call_soon_threadsafe(event_log.append, "approval.request", event)
 
         def run_sync() -> tuple[dict[str, Any], dict[str, int]]:
             approval_token = None
@@ -1272,29 +1287,32 @@ class InProcessAgentRunner:
             return await _write_json(writer, 404, _openai_error(f"Run not found: {run_id}", code="run_not_found"))
         return await _write_json(writer, 200, status)
 
-    async def _run_events(self, writer: StreamWriter, run_id: str) -> int:
+    async def _run_events(self, req: _ParsedRequest, writer: StreamWriter, run_id: str) -> int:
         for _ in range(20):
-            if run_id in self._run_streams:
+            if self._run_event_logs.get(run_id) is not None:
                 break
             await asyncio.sleep(0.05)
         else:
             return await _write_json(writer, 404, _openai_error(f"Run not found: {run_id}", code="run_not_found"))
         await writer.send_headers(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-        q = self._run_streams[run_id]
+        event_log = self._run_event_logs.get(run_id)
+        if event_log is None:
+            return 200
+        after_seq = _parse_after_seq(req.path)
         try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    await writer.send_chunk(b": keepalive\n\n")
-                    continue
-                if event is None:
-                    await writer.send_chunk(b": stream closed\n\n")
-                    break
+            async for retained in event_log.tail_after(after_seq, keepalive_seconds=30.0):
+                event = dict(retained.payload) if isinstance(retained.payload, dict) else {"event": retained.kind, "data": retained.payload}
+                event.setdefault("seq", retained.seq)
                 await _write_sse_data(writer, event)
-        finally:
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            await writer.send_chunk(b": stream closed\n\n")
+        except ResumeExpired as exc:
+            await _write_sse_data(writer, {
+                "event": "run.resume_expired",
+                "run_id": run_id,
+                "code": "RUN_RESUME_EXPIRED",
+                "floor_seq": exc.floor_seq,
+                "latest_seq": exc.latest_seq,
+            })
         return 200
 
     async def _stop_run(self, writer: StreamWriter, run_id: str) -> int:
@@ -1340,9 +1358,9 @@ class InProcessAgentRunner:
         if resolved <= 0:
             return await _write_json(writer, 409, _openai_error(f"Run has no pending approval: {run_id}", code="approval_not_pending"))
         self._set_run_status(run_id, "running", last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            await q.put({
+        event_log = self._run_event_logs.get(run_id)
+        if event_log is not None:
+            event_log.append("approval.responded", {
                 "event": "approval.responded",
                 "run_id": run_id,
                 "timestamp": time.time(),
@@ -1383,13 +1401,12 @@ class InProcessAgentRunner:
             self._sweep_orphaned_runs_once(time.time())
 
     def _sweep_orphaned_runs_once(self, now: float) -> None:
-        for run_id, created_at in list(self._run_streams_created.items()):
-            if now - created_at > _RUN_STREAM_TTL:
+        for run_id, event_log in list(self._run_event_logs._logs.items()):
+            if now - event_log.created_at > _RUN_STREAM_TTL:
                 task = self._active_run_tasks.get(run_id)
                 if task is not None and not task.done():
                     continue
-                self._run_streams.pop(run_id, None)
-                self._run_streams_created.pop(run_id, None)
+                self._run_event_logs.drop(run_id)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
@@ -1485,6 +1502,19 @@ def _parse_session_key(req: _ParsedRequest) -> str | None:
     if len(raw) > _MAX_SESSION_HEADER_LEN:
         raise _RequestError(400, "Session key too long")
     return raw
+
+
+def _parse_after_seq(path: str) -> int:
+    query = parse_qs(urlsplit(path).query)
+    for key in ("after_seq", "after", "cursor"):
+        raw = query.get(key, [""])[0]
+        if not raw:
+            continue
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
+    return 0
 
 
 async def _write_json(

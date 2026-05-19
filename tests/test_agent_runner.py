@@ -31,6 +31,17 @@ class CaptureWriter:
         return b"".join(self.chunks)
 
 
+class FailingChunkWriter(CaptureWriter):
+    def __init__(self, fail_after_chunks: int) -> None:
+        super().__init__()
+        self.fail_after_chunks = fail_after_chunks
+
+    async def send_chunk(self, chunk: bytes) -> None:
+        if len(self.chunks) >= self.fail_after_chunks:
+            raise RuntimeError("client disconnected")
+        await super().send_chunk(chunk)
+
+
 class Store:
     def __init__(self) -> None:
         self.responses: dict[str, dict] = {}
@@ -93,6 +104,21 @@ class BlockingAPI(FakeAPI):
         self.release = asyncio.Event()
 
     async def _run_agent(self, **kwargs):
+        await self.release.wait()
+        return await super()._run_agent(**kwargs)
+
+
+class DeltaThenBlockAPI(FakeAPI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _run_agent(self, **kwargs):
+        cb = kwargs.get("stream_delta_callback")
+        if cb:
+            cb("partial")
+        self.started.set()
         await self.release.wait()
         return await super()._run_agent(**kwargs)
 
@@ -608,6 +634,60 @@ async def test_run_create_status_and_events():
 
 
 @pytest.mark.asyncio
+async def test_run_events_can_be_replayed_after_first_consumer_finishes():
+    runner = InProcessAgentRunner(api_adapter=FakeAPI())
+    created = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"})
+    run_id = json.loads(created.body)["run_id"]
+
+    first = await _dispatch(runner, "GET", f"/v1/runs/{run_id}/events")
+    second = await _dispatch(runner, "GET", f"/v1/runs/{run_id}/events")
+
+    assert first.status == 200
+    assert second.status == 200
+    assert b"run.completed" in first.body
+    assert b"run.completed" in second.body
+
+
+@pytest.mark.asyncio
+async def test_run_events_after_cursor_replays_only_newer_events():
+    runner = InProcessAgentRunner(api_adapter=FakeAPI())
+    created = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"})
+    run_id = json.loads(created.body)["run_id"]
+
+    replay = await _dispatch(runner, "GET", f"/v1/runs/{run_id}/events?after=1")
+
+    assert replay.status == 200
+    assert b"message.delta" not in replay.body
+    assert b"run.completed" in replay.body
+
+
+@pytest.mark.asyncio
+async def test_run_event_log_survives_sse_client_disconnect_while_active():
+    api = DeltaThenBlockAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    created = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"})
+    run_id = json.loads(created.body)["run_id"]
+    await asyncio.wait_for(api.started.wait(), timeout=1.0)
+
+    dropped_writer = FailingChunkWriter(fail_after_chunks=0)
+    with pytest.raises(RuntimeError, match="client disconnected"):
+        await runner.dispatch(
+            "GET",
+            f"/v1/runs/{run_id}/events",
+            {"Content-Type": "application/json"},
+            b"",
+            dropped_writer,
+        )
+
+    assert runner._run_event_logs.get(run_id) is not None
+    api.release.set()
+    replay = await _dispatch(runner, "GET", f"/v1/runs/{run_id}/events")
+    assert replay.status == 200
+    assert b"message.delta" in replay.body
+    assert b"run.completed" in replay.body
+
+
+@pytest.mark.asyncio
 async def test_runs_reject_missing_previous_response_id():
     runner = InProcessAgentRunner(api_adapter=FakeAPI())
 
@@ -661,7 +741,7 @@ async def test_completed_poll_only_runs_do_not_exhaust_active_run_limit():
             break
         await asyncio.sleep(0.01)
     assert runner._active_run_count() == 0
-    assert len(runner._run_streams) == 10
+    assert len(runner._run_event_logs) == 10
 
     created = await _dispatch(runner, "POST", "/v1/runs", {"input": "hi"})
 
@@ -680,11 +760,11 @@ async def test_sweeper_does_not_drop_active_run_handles_by_age():
             break
         await asyncio.sleep(0.01)
     assert runner._active_run_count() == 1
-    runner._run_streams_created[run_id] = 0.0
+    runner._run_event_logs.get(run_id).created_at = 0.0
 
     runner._sweep_orphaned_runs_once(now=1_000.0)
 
-    assert run_id in runner._run_streams
+    assert runner._run_event_logs.get(run_id) is not None
     assert run_id in runner._active_run_tasks
     assert run_id in runner._run_approval_sessions
 

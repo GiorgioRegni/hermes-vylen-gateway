@@ -15,8 +15,14 @@ import re
 from typing import Any, Optional
 
 from .blobs import BlobRegistry
+from .chat_cursor import (
+    FRAME_CHAT_SUBSCRIBE,
+    FRAME_CHAT_UNSUBSCRIBE,
+    ChatCursorRelay,
+)
 from .client import HandshakeError, VylenGatewayClient
 from .config import ConfigError, load_from_env
+from .event_log import EventLogRegistry
 from .health import HealthReporter
 from .memory import FRAME_MEMORY_REQUEST, MemoryRPC
 from .relay import FRAME_REQUEST, FRAME_RESPONSE_RESUME, HermesRelay
@@ -125,6 +131,12 @@ def make_adapter_class():
             self._health: HealthReporter | None = None
             self._transcribe: Transcriber | None = None
             self._memory: MemoryRPC | None = None
+            self._chat_cursors: ChatCursorRelay | None = None
+            self._chat_event_logs = EventLogRegistry(
+                ttl_seconds=_env_float("VYLEN_CHAT_CURSOR_TTL_SECONDS", 900.0),
+                max_events=_env_int("VYLEN_CHAT_CURSOR_MAX_EVENTS", 1000),
+                max_bytes=_env_int("VYLEN_CHAT_CURSOR_MAX_BYTES", 4 * 1024 * 1024),
+            )
             # One blob registry per adapter lifetime; entries auto-expire
             # (see blobs.py). Resets implicitly across reconnects since the
             # adapter is reconstructed and the cloud only references tokens
@@ -180,6 +192,10 @@ def make_adapter_class():
                         await relay.handle(frame)
                     elif t == FRAME_RESPONSE_RESUME:
                         await relay.handle_resume(frame)
+                    elif t == FRAME_CHAT_SUBSCRIBE and self._chat_cursors is not None:
+                        await self._chat_cursors.handle_subscribe(frame)
+                    elif t == FRAME_CHAT_UNSUBSCRIBE and self._chat_cursors is not None:
+                        self._chat_cursors.cancel(str(frame.get("request_id") or ""))
                     elif t == FRAME_TRANSCRIBE and transcriber is not None:
                         await transcriber.handle(frame)
                     elif t == FRAME_MEMORY_REQUEST and memory is not None:
@@ -224,6 +240,11 @@ def make_adapter_class():
                 blobs=self._blobs,
                 response_buffers=self._response_buffers,
             )
+            self._chat_cursors = ChatCursorRelay(
+                client.send,
+                self._chat_event_logs,
+                disabled=bool(os.environ.get("VYLEN_CHAT_CURSOR_DISABLE")),
+            )
             self._health = HealthReporter(client.send)
             self._health.start()
             self._transcribe = Transcriber(client.send)
@@ -254,6 +275,9 @@ def make_adapter_class():
             if self._relay:
                 await self._relay.close()
                 self._relay = None
+            if self._chat_cursors:
+                await self._chat_cursors.close()
+                self._chat_cursors = None
             # BlobRegistry holds no OS resources (just an in-memory map);
             # drop the reference so any outstanding tokens immediately
             # become unaddressable across reconnects.
@@ -290,6 +314,10 @@ def make_adapter_class():
             if cron_job_name:
                 frame["cron_job_name"] = cron_job_name
             try:
+                if self._chat_cursors is not None:
+                    seq = self._chat_cursors.append_push(frame)
+                    if seq is not None:
+                        frame["seq"] = seq
                 await self._client.send(frame)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("vylen gateway: push frame send failed: %s", exc)
@@ -349,6 +377,10 @@ def make_adapter_class():
             if cron_job_name:
                 frame["cron_job_name"] = cron_job_name
             try:
+                if self._chat_cursors is not None:
+                    seq = self._chat_cursors.append_push(frame)
+                    if seq is not None:
+                        frame["seq"] = seq
                 await self._client.send(frame)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("vylen gateway: image push frame send failed: %s", exc)
