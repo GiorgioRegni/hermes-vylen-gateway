@@ -514,7 +514,9 @@ class InProcessAgentRunner:
             usage: dict[str, int] = {}
             stream_error: str | None = None
             try:
-                _result, usage = await task
+                result, usage = await task
+                if isinstance(result, dict) and result.get("failed"):
+                    stream_error = str(result.get("error") or "agent run failed")
             except Exception as exc:  # noqa: BLE001
                 stream_error = str(exc)
                 logger.warning("chat completion stream failed: %s", exc)
@@ -660,10 +662,7 @@ class InProcessAgentRunner:
             return response_data, response_headers
 
         if idempotency_key is not None:
-            fingerprint = _make_request_fingerprint(
-                body,
-                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
-            )
+            fingerprint = _make_request_fingerprint(body)
             cached = self._response_idempotency_keys.get(idempotency_key)
             if cached is not None:
                 if (
@@ -1434,11 +1433,11 @@ def _parse_idempotency_key(req: _ParsedRequest) -> str | None:
     return raw
 
 
-def _make_request_fingerprint(body: dict[str, Any], keys: list[str]) -> str:
+def _make_request_fingerprint(body: dict[str, Any]) -> str:
     from hashlib import sha256
 
-    subset = {key: body.get(key) for key in keys}
-    return sha256(repr(subset).encode("utf-8")).hexdigest()
+    fingerprint_body = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(fingerprint_body.encode("utf-8")).hexdigest()
 
 
 def _coerce_stream_flag(value: Any) -> bool:

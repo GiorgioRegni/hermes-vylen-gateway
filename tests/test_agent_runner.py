@@ -280,6 +280,24 @@ async def test_stream_chat_agent_exception_emits_error_not_stop():
 
 
 @pytest.mark.asyncio
+async def test_stream_chat_failed_result_emits_error_not_stop():
+    runner = InProcessAgentRunner(api_adapter=FailedResultAPI())
+
+    writer = await _dispatch(
+        runner,
+        "POST",
+        "/v1/chat/completions",
+        {"stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert writer.status == 200
+    assert b"event: error" in writer.body
+    assert b"provider auth failed" in writer.body
+    assert b'"finish_reason": "stop"' not in writer.body
+    assert writer.body.endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
 async def test_chat_completion_failed_result_returns_error():
     runner = InProcessAgentRunner(api_adapter=FailedResultAPI())
 
@@ -355,6 +373,35 @@ async def test_responses_idempotency_key_does_not_cache_different_fingerprint_fi
 
     first = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "model": "a"}, headers=headers)
     second = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "model": "b"}, headers=headers)
+
+    first_payload = json.loads(first.body)
+    second_payload = json.loads(second.body)
+    assert first.status == 200
+    assert second.status == 200
+    assert second_payload["id"] != first_payload["id"]
+    assert api.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_responses_idempotency_key_does_not_cache_different_conversation_history():
+    api = CountingAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}
+
+    first = await _dispatch(
+        runner,
+        "POST",
+        "/v1/responses",
+        {"input": "hi", "conversation_history": [{"role": "user", "content": "first context"}]},
+        headers=headers,
+    )
+    second = await _dispatch(
+        runner,
+        "POST",
+        "/v1/responses",
+        {"input": "hi", "conversation_history": [{"role": "user", "content": "second context"}]},
+        headers=headers,
+    )
 
     first_payload = json.loads(first.body)
     second_payload = json.loads(second.body)
