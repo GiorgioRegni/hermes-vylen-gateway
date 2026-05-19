@@ -121,7 +121,11 @@ class BlockingCountingAPI(CountingAPI):
         self.calls += 1
         self.started.set()
         await self.release.wait()
-        return await FakeAPI._run_agent(self, **kwargs)
+        result, usage = await FakeAPI._run_agent(self, **kwargs)
+        final_response = f"hello: {kwargs.get('user_message')}"
+        result["final_response"] = final_response
+        result["messages"] = [{"role": "assistant", "content": final_response}]
+        return result, usage
 
 
 class CancellableAPI(FakeAPI):
