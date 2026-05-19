@@ -608,6 +608,21 @@ async def test_run_create_status_and_events():
 
 
 @pytest.mark.asyncio
+async def test_runs_reject_missing_previous_response_id():
+    runner = InProcessAgentRunner(api_adapter=FakeAPI())
+
+    writer = await _dispatch(
+        runner,
+        "POST",
+        "/v1/runs",
+        {"input": "hi", "previous_response_id": "resp_missing"},
+    )
+
+    assert writer.status == 404
+    assert json.loads(writer.body)["error"]["message"] == "Previous response not found: resp_missing"
+
+
+@pytest.mark.asyncio
 async def test_runs_idempotency_key_returns_cached_run_for_same_body():
     runner = InProcessAgentRunner(api_adapter=FakeAPI())
     headers = {"Content-Type": "application/json", "Idempotency-Key": "retry-key"}

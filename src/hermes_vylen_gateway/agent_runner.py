@@ -1059,9 +1059,10 @@ class InProcessAgentRunner:
         stored_session_id = None
         if not conversation_history and previous_response_id:
             stored = api._response_store.get(previous_response_id)
-            if stored:
-                conversation_history = list(stored.get("conversation_history", []))
-                stored_session_id = stored.get("session_id")
+            if stored is None:
+                raise _RequestError(404, f"Previous response not found: {previous_response_id}")
+            conversation_history = list(stored.get("conversation_history", []))
+            stored_session_id = stored.get("session_id")
         run_id = f"run_{uuid.uuid4().hex}"
         if idempotency_key is not None:
             self._idempotency_keys[idempotency_key] = _CachedRun(
