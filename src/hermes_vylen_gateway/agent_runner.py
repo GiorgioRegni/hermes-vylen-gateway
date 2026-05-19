@@ -26,6 +26,8 @@ _RUN_STREAM_TTL = 300
 _RUN_STATUS_TTL = 3600
 _MAX_CONCURRENT_RUNS = 10
 _MAX_SESSION_HEADER_LEN = 256
+_MAX_IDEMPOTENCY_KEY_LEN = 256
+_IDEMPOTENCY_TTL = _RUN_STATUS_TTL
 
 
 class StreamWriter(Protocol):
@@ -126,6 +128,10 @@ class InProcessAgentRunner:
         self._active_run_tasks: dict[str, asyncio.Task[Any]] = {}
         self._run_statuses: dict[str, dict[str, Any]] = {}
         self._run_approval_sessions: dict[str, str] = {}
+        # Idempotency-Key → (run_id, created_at). Lets clients retry POST
+        # /v1/runs without spawning duplicate agents; mirrors the dedupe
+        # behavior the old HTTP relay inherited from Hermes's API server.
+        self._idempotency_keys: dict[str, tuple[str, float]] = {}
         self._sweep_task: asyncio.Task[Any] | None = None
 
     def ensure_api(self) -> Any:
@@ -910,6 +916,19 @@ class InProcessAgentRunner:
         return await _write_json(writer, 200, {"id": response_id, "object": "response", "deleted": True})
 
     async def _create_run(self, req: _ParsedRequest, writer: StreamWriter, api: Any) -> int:
+        idempotency_key = _parse_idempotency_key(req)
+        if idempotency_key is not None:
+            cached = self._idempotency_keys.get(idempotency_key)
+            if cached is not None:
+                cached_run_id, cached_at = cached
+                if time.time() - cached_at <= _IDEMPOTENCY_TTL and cached_run_id in self._run_statuses:
+                    return await _write_json(
+                        writer,
+                        202,
+                        {"run_id": cached_run_id, "status": "started"},
+                    )
+                # Stale or evicted; drop and fall through to a fresh allocation.
+                self._idempotency_keys.pop(idempotency_key, None)
         if self._active_run_count() >= _MAX_CONCURRENT_RUNS:
             return await _write_json(
                 writer,
@@ -939,6 +958,8 @@ class InProcessAgentRunner:
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
         run_id = f"run_{uuid.uuid4().hex}"
+        if idempotency_key is not None:
+            self._idempotency_keys[idempotency_key] = (run_id, time.time())
         session_id = body.get("session_id") or stored_session_id or run_id
         gateway_session_key = _parse_session_key(req)
         approval_session_key = gateway_session_key or session_id or run_id
@@ -1265,6 +1286,9 @@ class InProcessAgentRunner:
         for run_id, status in list(self._run_statuses.items()):
             if status.get("status") in {"completed", "failed", "cancelled"} and now - float(status.get("updated_at", 0) or 0) > _RUN_STATUS_TTL:
                 self._run_statuses.pop(run_id, None)
+        for key, (_, created_at) in list(self._idempotency_keys.items()):
+            if now - created_at > _IDEMPOTENCY_TTL:
+                self._idempotency_keys.pop(key, None)
 
     def _normalize_chat_content(self, content: Any) -> str:
         fn = getattr(self._api_module, "_normalize_chat_content", None)
@@ -1299,6 +1323,17 @@ class InProcessAgentRunner:
         if not message:
             code, message = "invalid_content_part", raw
         return _RequestError(400, message, code=code, param=param)
+
+
+def _parse_idempotency_key(req: _ParsedRequest) -> str | None:
+    raw = req.header("Idempotency-Key", "").strip()
+    if not raw:
+        return None
+    if re.search(r"[\r\n\x00]", raw):
+        raise _RequestError(400, "Invalid Idempotency-Key")
+    if len(raw) > _MAX_IDEMPOTENCY_KEY_LEN:
+        raise _RequestError(400, "Idempotency-Key too long")
+    return raw
 
 
 def _coerce_stream_flag(value: Any) -> bool:
