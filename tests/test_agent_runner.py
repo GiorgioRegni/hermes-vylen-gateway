@@ -168,6 +168,14 @@ class FailedResultAPI(CountingAPI):
         }, {"input_tokens": 4, "output_tokens": 0, "total_tokens": 4}
 
 
+class RaisingAPI(FakeAPI):
+    async def _run_agent(self, **kwargs):
+        cb = kwargs.get("stream_delta_callback")
+        if cb:
+            cb("partial")
+        raise RuntimeError("provider crashed")
+
+
 async def _dispatch(runner, method, path, body=None, headers=None):
     writer = CaptureWriter()
     await runner.dispatch(
@@ -229,6 +237,17 @@ async def test_responses_stream_persists_and_emits_sse():
 
 
 @pytest.mark.asyncio
+async def test_responses_stream_store_false_string_does_not_persist():
+    api = FakeAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+    writer = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "stream": True, "store": "false"})
+
+    assert writer.status == 200
+    assert b"event: response.completed" in writer.body
+    assert api._response_store.responses == {}
+
+
+@pytest.mark.asyncio
 async def test_stream_response_failed_result_emits_failed_event():
     api = FailedResultAPI()
     runner = InProcessAgentRunner(api_adapter=api)
@@ -240,6 +259,24 @@ async def test_stream_response_failed_result_emits_failed_event():
     stored = next(iter(api._response_store.responses.values()))
     assert stored["response"]["status"] == "failed"
     assert stored["response"]["error"] == {"message": "provider auth failed", "type": "server_error"}
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_agent_exception_emits_error_not_stop():
+    runner = InProcessAgentRunner(api_adapter=RaisingAPI())
+
+    writer = await _dispatch(
+        runner,
+        "POST",
+        "/v1/chat/completions",
+        {"stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert writer.status == 200
+    assert b"event: error" in writer.body
+    assert b"provider crashed" in writer.body
+    assert b'"finish_reason": "stop"' not in writer.body
+    assert writer.body.endswith(b"data: [DONE]\n\n")
 
 
 @pytest.mark.asyncio
@@ -278,6 +315,18 @@ async def test_responses_idempotency_key_returns_cached_response():
     assert second.status == 200
     assert second_payload["id"] == first_payload["id"]
     assert api.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_store_false_string_does_not_persist():
+    api = FakeAPI()
+    runner = InProcessAgentRunner(api_adapter=api)
+
+    writer = await _dispatch(runner, "POST", "/v1/responses", {"input": "hi", "store": "false"})
+
+    assert writer.status == 200
+    assert json.loads(writer.body)["status"] == "completed"
+    assert api._response_store.responses == {}
 
 
 @pytest.mark.asyncio

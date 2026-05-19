@@ -512,10 +512,20 @@ class InProcessAgentRunner:
                 last_activity = time.monotonic()
 
             usage: dict[str, int] = {}
+            stream_error: str | None = None
             try:
                 _result, usage = await task
             except Exception as exc:  # noqa: BLE001
+                stream_error = str(exc)
                 logger.warning("chat completion stream failed: %s", exc)
+            if stream_error:
+                await _write_sse_event(
+                    writer,
+                    "error",
+                    _openai_error(stream_error, err_type="server_error"),
+                )
+                await writer.send_chunk(b"data: [DONE]\n\n")
+                return 200
             finish = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -539,7 +549,7 @@ class InProcessAgentRunner:
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
-        store = body.get("store", True)
+        store = _coerce_stream_flag(body.get("store", True))
         if conversation and previous_response_id:
             raise _RequestError(400, "Cannot use both 'conversation' and 'previous_response_id'")
         if conversation:
