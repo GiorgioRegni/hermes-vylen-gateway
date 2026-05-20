@@ -514,6 +514,13 @@ def make_adapter_class():
             was_cancelled = turn_id in self._cancelled_turns
             outcome_value = str(getattr(outcome, "value", outcome) or "")
             if was_cancelled:
+                assistant_message_ids = self._assistant_messages_by_turn.pop(turn_id, set())
+                for assistant_message_id in assistant_message_ids:
+                    self._assistant_turn_by_message.pop(assistant_message_id, None)
+                for activity_id in self._activity_ids_by_turn.pop(turn_id, set()):
+                    self._activity_payloads_by_id.pop(activity_id, None)
+                    self._activity_status_by_id.pop(activity_id, None)
+                self._cancelled_turns.discard(turn_id)
                 active = self._active_turns_by_chat.get(chat_id)
                 if active and active.get("turn_id") == turn_id:
                     self._active_turns_by_chat.pop(chat_id, None)
@@ -875,7 +882,12 @@ def make_adapter_class():
                 if not turn_id or active is None or active.get("turn_id") != turn_id:
                     await self._send_chat_action_error(frame, "TURN_NOT_ACTIVE", "This turn is no longer active")
                     return
-                await self._dispatch_native_stop(chat_id, active)
+                try:
+                    await self._dispatch_native_stop(chat_id, active)
+                except Exception as exc:  # noqa: BLE001
+                    self._cancel_active_turn(chat_id, active, reason="user_stop")
+                    await self._send_chat_action_error(frame, "TURN_CANCEL_FAILED", str(exc))
+                    return
                 self._cancel_active_turn(chat_id, active, reason="user_stop")
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
@@ -908,6 +920,9 @@ def make_adapter_class():
                 return
 
             try:
+                # Approval and slash-confirm cards are Hermes callback
+                # surfaces. Resolve the pending callback; do not mutate
+                # Hermes running-agent/session internals from this branch.
                 if expected_kind == "approval":
                     from tools.approval import resolve_gateway_approval
 
@@ -919,7 +934,17 @@ def make_adapter_class():
                 else:
                     from tools import slash_confirm as _slash_confirm_mod
 
-                    follow_up = await _slash_confirm_mod.resolve(record["session_key"], action_id, choice)
+                    pending = _slash_confirm_mod.get_pending(record["session_key"])
+                    if not pending or pending.get("confirm_id") != action_id:
+                        self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="resolver_lost")
+                        await self._send_chat_action_error(frame, "STALE_ACTION", "This confirmation is no longer available")
+                        return
+                    follow_up = await _slash_confirm_mod.resolve(
+                        record["session_key"],
+                        action_id,
+                        choice,
+                        timeout=self._action_ttl_seconds,
+                    )
                     if follow_up:
                         self._append_assistant_message(chat_id, follow_up, record.get("turn_id"))
             except Exception as exc:  # noqa: BLE001

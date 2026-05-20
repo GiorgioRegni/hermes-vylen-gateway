@@ -546,6 +546,36 @@ async def test_turn_cancel_action_cancels_active_session(adapter):
 
 
 @pytest.mark.asyncio
+async def test_turn_cancel_dispatch_failure_returns_error_and_closes_turn(adapter, monkeypatch):
+    turn_id = "turn_cancel_fail"
+    adapter._active_turns_by_chat["chat_a"] = {
+        "turn_id": turn_id,
+        "message_id": "msg_user",
+        "session_key": "vylen:chat_a:user_1",
+        "source": FakeSessionSource(platform=adapter.platform, chat_id="chat_a", user_id="user_1"),
+    }
+
+    async def fail_dispatch(chat_id, active):
+        raise RuntimeError("native stop failed")
+
+    monkeypatch.setattr(adapter, "_dispatch_native_stop", fail_dispatch)
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "cancel_req_fail",
+        "chat_id": "chat_a",
+        "turn_id": turn_id,
+        "action": "turn.cancel",
+    })
+
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["code"] == "TURN_CANCEL_FAILED"
+    assert "chat_a" not in adapter._active_turns_by_chat
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert any(event.kind == "turn.cancelled" and event.payload["turn_id"] == turn_id for event in events)
+
+
+@pytest.mark.asyncio
 async def test_turn_cancel_fences_late_output_from_cancelled_task(adapter):
     ready = asyncio.Event()
     release = asyncio.Event()
@@ -649,6 +679,34 @@ async def test_new_turn_after_cancel_gets_clean_output(adapter):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_processing_complete_cleans_turn_bookkeeping(adapter):
+    turn_id = "turn_cancelled_cleanup"
+    event = FakeMessageEvent(
+        text="cancelled",
+        source=FakeSessionSource(platform=adapter.platform, chat_id="chat_a", user_id="user_1"),
+        message_id="msg_user",
+        raw_message={"turn_id": turn_id},
+    )
+    adapter._cancelled_turns.add(turn_id)
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": turn_id}
+    adapter._assistant_messages_by_turn[turn_id] = {"msg_asst"}
+    adapter._assistant_turn_by_message["msg_asst"] = turn_id
+    adapter._activity_ids_by_turn[turn_id] = {"activity_1"}
+    adapter._activity_payloads_by_id["activity_1"] = ("terminal", "rm", "💻")
+    adapter._activity_status_by_id["activity_1"] = "running"
+
+    await adapter.on_processing_complete(event, types.SimpleNamespace(value="success"))
+
+    assert "chat_a" not in adapter._active_turns_by_chat
+    assert turn_id not in adapter._assistant_messages_by_turn
+    assert "msg_asst" not in adapter._assistant_turn_by_message
+    assert turn_id not in adapter._activity_ids_by_turn
+    assert "activity_1" not in adapter._activity_payloads_by_id
+    assert "activity_1" not in adapter._activity_status_by_id
+    assert turn_id not in adapter._cancelled_turns
+
+
+@pytest.mark.asyncio
 async def test_expired_approval_action_emits_retained_expiry_and_error(adapter):
     adapter._action_ttl_seconds = -1
 
@@ -706,3 +764,143 @@ async def test_mismatched_chat_action_does_not_expire_other_chat_card(adapter):
     assert "approval.requested" in chat_a_kinds
     assert "approval.expired" not in chat_a_kinds
     assert adapter._chat_event_logs.get("chat_b") is None
+
+
+def _install_fake_approval_tools(monkeypatch, *, approval_count: int = 1, confirm_follow_up: str | None = None):
+    tools_mod = types.ModuleType("tools")
+    approval_mod = types.ModuleType("tools.approval")
+    slash_confirm_mod = types.ModuleType("tools.slash_confirm")
+    calls: dict[str, list[tuple[Any, ...]]] = {"approval": [], "confirm": []}
+    pending_confirms: dict[str, dict[str, Any]] = {"session_a": {"confirm_id": "confirm_1"}}
+
+    def resolve_gateway_approval(session_key, choice):
+        calls["approval"].append((session_key, choice))
+        return approval_count
+
+    def get_pending(session_key):
+        pending = pending_confirms.get(session_key)
+        return dict(pending) if pending else None
+
+    async def resolve(session_key, confirm_id, choice, timeout=300):
+        calls["confirm"].append((session_key, confirm_id, choice, timeout))
+        pending_confirms.pop(session_key, None)
+        return confirm_follow_up
+
+    approval_mod.resolve_gateway_approval = resolve_gateway_approval
+    slash_confirm_mod.get_pending = get_pending
+    slash_confirm_mod.resolve = resolve
+    tools_mod.approval = approval_mod
+    tools_mod.slash_confirm = slash_confirm_mod
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.approval", approval_mod)
+    monkeypatch.setitem(sys.modules, "tools.slash_confirm", slash_confirm_mod)
+    return calls
+
+
+def _install_hermes_session_sentinels(adapter):
+    adapter._running_agents = {"session_a": "running-agent-sentinel"}
+    adapter._active_sessions = {"session_a": "active-session-sentinel"}
+    adapter._session_run_generation = {"session_a": 7}
+    adapter._pending_messages = {"session_a": "pending-message-sentinel"}
+    return {
+        "running_agents": dict(adapter._running_agents),
+        "active_sessions": dict(adapter._active_sessions),
+        "session_run_generation": dict(adapter._session_run_generation),
+        "pending_messages": dict(adapter._pending_messages),
+    }
+
+
+def _assert_hermes_session_sentinels_unchanged(adapter, before):
+    assert adapter._running_agents == before["running_agents"]
+    assert adapter._active_sessions == before["active_sessions"]
+    assert adapter._session_run_generation == before["session_run_generation"]
+    assert adapter._pending_messages == before["pending_messages"]
+
+
+@pytest.mark.asyncio
+async def test_approval_response_resolves_hermes_callback_without_session_mutation(adapter, monkeypatch):
+    calls = _install_fake_approval_tools(monkeypatch)
+    result = await adapter.send_exec_approval(
+        chat_id="chat_a",
+        command="rm -rf tmp/build",
+        session_key="session_a",
+        description="dangerous command",
+    )
+    assert result.success
+    action_id = next(iter(adapter._action_cards))
+    before = _install_hermes_session_sentinels(adapter)
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "action_req_approval",
+        "chat_id": "chat_a",
+        "action_id": action_id,
+        "action": "approval.respond",
+        "choice": "once",
+    })
+
+    assert calls["approval"] == [("session_a", "once")]
+    _assert_hermes_session_sentinels_unchanged(adapter, before)
+    kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
+    assert "approval.resolved" in kinds
+
+
+@pytest.mark.asyncio
+async def test_confirm_response_resolves_hermes_callback_without_session_mutation(adapter, monkeypatch):
+    calls = _install_fake_approval_tools(monkeypatch)
+    result = await adapter.send_slash_confirm(
+        chat_id="chat_a",
+        title="Confirm action",
+        message="Proceed?",
+        session_key="session_a",
+        confirm_id="confirm_1",
+    )
+    assert result.success
+    before = _install_hermes_session_sentinels(adapter)
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "action_req_confirm",
+        "chat_id": "chat_a",
+        "action_id": "confirm_1",
+        "action": "confirm.respond",
+        "choice": "once",
+    })
+
+    assert calls["confirm"] == [("session_a", "confirm_1", "once", adapter._action_ttl_seconds)]
+    _assert_hermes_session_sentinels_unchanged(adapter, before)
+    kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
+    assert "confirm.resolved" in kinds
+    follow_ups = [
+        event for event in adapter._chat_event_logs.get("chat_a").events
+        if event.kind.startswith("message.") and event.payload.get("text") == "Confirmed."
+    ]
+    assert follow_ups == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_response_errors_when_hermes_pending_callback_is_missing(adapter, monkeypatch):
+    calls = _install_fake_approval_tools(monkeypatch)
+    result = await adapter.send_slash_confirm(
+        chat_id="chat_a",
+        title="Confirm action",
+        message="Proceed?",
+        session_key="missing_session",
+        confirm_id="confirm_1",
+    )
+    assert result.success
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "action_req_confirm_stale",
+        "chat_id": "chat_a",
+        "action_id": "confirm_1",
+        "action": "confirm.respond",
+        "choice": "once",
+    })
+
+    assert calls["confirm"] == []
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["code"] == "STALE_ACTION"
+    kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
+    assert "confirm.expired" in kinds
