@@ -496,6 +496,8 @@ async def test_generated_image_file_is_retained_as_chat_attachment(adapter, tmp_
 @pytest.mark.asyncio
 async def test_turn_cancel_action_cancels_active_session(adapter):
     async def handler(event):
+        if event.text == "/stop":
+            return "Stopped. You can continue this session."
         return None
 
     adapter.set_message_handler(handler)
@@ -535,6 +537,12 @@ async def test_turn_cancel_action_cancels_active_session(adapter):
         and event.payload.get("turn_id") == turn_id
     ]
     assert placeholder[-1].payload["status"] == "cancelled"
+    stop_messages = [
+        event for event in events
+        if event.kind.startswith("message.")
+        and "Stopped. You can continue this session." in str(event.payload.get("text") or "")
+    ]
+    assert stop_messages == []
 
 
 @pytest.mark.asyncio

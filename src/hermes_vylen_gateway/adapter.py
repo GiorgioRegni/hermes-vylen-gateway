@@ -165,6 +165,7 @@ def make_adapter_class():
             self._active_turns_by_chat: dict[str, dict[str, Any]] = {}
             self._turns_by_task: dict[asyncio.Task, dict[str, Any]] = {}
             self._cancelled_turns: set[str] = set()
+            self._suppress_response_tasks: set[asyncio.Task] = set()
             self._assistant_turn_by_message: dict[str, str] = {}
             self._assistant_messages_by_turn: dict[str, set[str]] = {}
             self._activity_groups_by_message: dict[str, list[dict[str, str]]] = {}
@@ -340,6 +341,10 @@ def make_adapter_class():
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
             from gateway.platforms.base import SendResult
+
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task in self._suppress_response_tasks:
+                return SendResult(success=True, message_id=_message_id("suppressed"))
 
             task_turn = self._turns_by_task.get(asyncio.current_task())
             active_turn = task_turn or self._active_turns_by_chat.get(str(chat_id))
@@ -1141,11 +1146,18 @@ def make_adapter_class():
             source = active.get("source")
             if source is None:
                 return
-            await self.handle_message(self._build_command_event(
-                source=source,
-                text="/stop",
-                turn_id=str(active.get("turn_id") or ""),
-            ))
+            task = asyncio.current_task()
+            if task is not None:
+                self._suppress_response_tasks.add(task)
+            try:
+                await self.handle_message(self._build_command_event(
+                    source=source,
+                    text="/stop",
+                    turn_id=str(active.get("turn_id") or ""),
+                ))
+            finally:
+                if task is not None:
+                    self._suppress_response_tasks.discard(task)
 
         def _emit_tool_progress(
             self,
