@@ -92,6 +92,7 @@ class VylenGatewayClient:
                     # with the cloud's body cap in
                     # cloud/internal/cloud/server.go.
                     max_size=16 * 1024 * 1024,
+                    open_timeout=timeout,
                 ),
                 timeout=timeout,
             )
