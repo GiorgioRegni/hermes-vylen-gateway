@@ -866,7 +866,7 @@ def make_adapter_class():
                     await self._send_chat_action_error(frame, "TURN_NOT_ACTIVE", "This turn is no longer active")
                     return
                 self._cancel_active_turn(chat_id, active, reason="user_stop")
-                await self.cancel_session_processing(str(active.get("session_key") or ""))
+                await self._cancel_session_and_drain_pending(str(active.get("session_key") or ""))
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
                     "request_id": request_id,
@@ -1115,6 +1115,21 @@ def make_adapter_class():
             current = self._active_turns_by_chat.get(chat_id)
             if current and current.get("turn_id") == turn_id:
                 self._active_turns_by_chat.pop(chat_id, None)
+
+        async def _cancel_session_and_drain_pending(self, session_key: str) -> None:
+            if not session_key:
+                return
+            await self.cancel_session_processing(session_key, discard_pending=False)
+            pending_messages = getattr(self, "_pending_messages", None)
+            if not isinstance(pending_messages, dict):
+                return
+            pending_event = pending_messages.pop(session_key, None)
+            if pending_event is None:
+                return
+            start_processing = getattr(self, "_start_session_processing", None)
+            if callable(start_processing) and start_processing(pending_event, session_key):
+                return
+            await self.handle_message(pending_event)
 
         def _emit_tool_progress(
             self,
