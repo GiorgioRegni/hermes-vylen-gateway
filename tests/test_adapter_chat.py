@@ -398,13 +398,20 @@ async def test_tool_progress_marks_prior_rows_completed_before_turn_finishes(ada
 
 
 @pytest.mark.asyncio
-async def test_chat_message_decodes_inline_image_data_url(adapter):
+async def test_chat_message_decodes_inline_image_data_url(adapter, monkeypatch, tmp_path):
     seen: list[FakeMessageEvent] = []
 
     async def handler(event):
         seen.append(event)
         return None
 
+    image_path = tmp_path / "whiteboard.png"
+    base_mod = sys.modules["gateway.platforms.base"]
+    monkeypatch.setattr(
+        base_mod,
+        "cache_image_from_bytes",
+        lambda data, ext=".jpg": (image_path.write_bytes(data), str(image_path))[1],
+    )
     png = base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode("ascii")
     adapter.set_message_handler(handler)
 
@@ -417,8 +424,18 @@ async def test_chat_message_decodes_inline_image_data_url(adapter):
     }]))
 
     assert seen[0].message_type == FakeMessageType.PHOTO
-    assert seen[0].media_urls == ["/tmp/fake-image.png"]
+    assert seen[0].media_urls == [str(image_path)]
     assert seen[0].media_types == ["image"]
+    user_event = next(
+        event
+        for event in adapter._chat_event_logs.get("chat_a").events
+        if event.kind == "message.created" and event.payload.get("role") == "user"
+    )
+    attachments = user_event.payload["attachments"]
+    assert attachments[0]["type"] == "image"
+    assert attachments[0]["mime_type"] == "image/png"
+    assert attachments[0]["filename"] == "whiteboard.png"
+    assert attachments[0]["data_url"].startswith("/v1/instances/inst_1/blobs/")
 
 
 @pytest.mark.asyncio
@@ -636,3 +653,33 @@ async def test_expired_approval_action_emits_retained_expiry_and_error(adapter):
     kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
     assert "approval.requested" in kinds
     assert "approval.expired" in kinds
+
+
+@pytest.mark.asyncio
+async def test_mismatched_chat_action_does_not_expire_other_chat_card(adapter):
+    result = await adapter.send_exec_approval(
+        chat_id="chat_a",
+        command="rm -rf tmp/build",
+        session_key="session_a",
+        description="dangerous command",
+    )
+    assert result.success
+    action_id = next(iter(adapter._action_cards))
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "action_req_wrong_chat",
+        "chat_id": "chat_b",
+        "action_id": action_id,
+        "action": "approval.respond",
+        "choice": "once",
+    })
+
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["code"] == "STALE_ACTION"
+    assert action_id in adapter._action_cards
+
+    chat_a_kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
+    assert "approval.requested" in chat_a_kinds
+    assert "approval.expired" not in chat_a_kinds
+    assert adapter._chat_event_logs.get("chat_b") is None

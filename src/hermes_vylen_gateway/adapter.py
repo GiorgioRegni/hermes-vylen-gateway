@@ -778,6 +778,7 @@ def make_adapter_class():
 
             try:
                 attachment_result = self._decode_attachments(frame.get("attachments"))
+                await self._register_decoded_attachment_urls(attachment_result)
             except ValueError as exc:
                 await self._send_chat_message_error(frame, "INVALID_ATTACHMENT", str(exc))
                 return
@@ -880,12 +881,10 @@ def make_adapter_class():
 
             record = self._action_cards.get(action_id)
             expected_kind = "approval" if action == "approval.respond" else "confirm"
-            if (
-                record is None
-                or record.get("chat_id") != chat_id
-                or record.get("kind") != expected_kind
-                or float(record.get("expires_at") or 0) <= time.time()
-            ):
+            if record is None or record.get("chat_id") != chat_id or record.get("kind") != expected_kind:
+                await self._send_chat_action_error(frame, "STALE_ACTION", "This action is no longer available")
+                return
+            if float(record.get("expires_at") or 0) <= time.time():
                 self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="stale_action")
                 await self._send_chat_action_error(frame, "STALE_ACTION", "This action is no longer available")
                 return
@@ -981,6 +980,22 @@ def make_adapter_class():
                 media_urls=media_urls,
                 media_types=media_types,
             )
+
+        async def _register_decoded_attachment_urls(self, attachment_result: dict[str, list[Any]]) -> None:
+            public = attachment_result.get("public") or []
+            paths = attachment_result.get("paths") or []
+            if not public:
+                return
+            if self._blobs is None or not self._instance_id:
+                raise ValueError("attachment blob registry is unavailable")
+            for attachment, path in zip(public, paths, strict=False):
+                registered = await self._blobs.register(path)
+                if registered is None:
+                    raise ValueError("attachment file is unavailable")
+                token, mime_type, filename = registered
+                attachment["data_url"] = f"/v1/instances/{self._instance_id}/blobs/{token}"
+                attachment["mime_type"] = mime_type
+                attachment["filename"] = attachment.get("filename") or filename
 
         def _decode_attachments(self, attachments: Any) -> dict[str, list[Any]]:
             if attachments is None:
