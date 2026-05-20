@@ -68,8 +68,10 @@ class FakeBasePlatformAdapter:
         self.config = config
         self.platform = platform
         self._message_handler = None
+        self.handled_events: list[Any] = []
         self.cancelled_sessions: list[str] = []
         self.cancel_kwargs: list[dict[str, Any]] = []
+        self._active_sessions: dict[str, Any] = {}
         self._pending_messages: dict[str, Any] = {}
         self.started_sessions: list[tuple[str, Any]] = []
 
@@ -77,7 +79,10 @@ class FakeBasePlatformAdapter:
         self._message_handler = handler
 
     async def handle_message(self, event) -> None:
+        self.handled_events.append(event)
         if self._message_handler is None:
+            return
+        if event.text == "/stop":
             return
         await self.on_processing_start(event)
         outcome = types.SimpleNamespace(value="success")
@@ -504,6 +509,7 @@ async def test_turn_cancel_action_cancels_active_session(adapter):
         "turn_id": turn_id,
         "message_id": "msg_user",
         "session_key": "vylen:chat_a:user_1",
+        "source": FakeSessionSource(platform=adapter.platform, chat_id="chat_a", user_id="user_1"),
     }
 
     await adapter._handle_chat_action({
@@ -514,8 +520,8 @@ async def test_turn_cancel_action_cancels_active_session(adapter):
         "action": "turn.cancel",
     })
 
-    assert adapter.cancelled_sessions == ["vylen:chat_a:user_1"]
-    assert adapter.cancel_kwargs[-1] == {"discard_pending": False}
+    handled_texts = [event.text for event in adapter.handled_events]
+    assert handled_texts == ["hello", "/stop"]
     acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
     assert acks[-1]["turn_id"] == turn_id
     events = adapter._chat_event_logs.get("chat_a").events
@@ -529,41 +535,6 @@ async def test_turn_cancel_action_cancels_active_session(adapter):
         and event.payload.get("turn_id") == turn_id
     ]
     assert placeholder[-1].payload["status"] == "cancelled"
-
-
-@pytest.mark.asyncio
-async def test_turn_cancel_preserves_and_drains_pending_followup(adapter):
-    turn_id = "turn_active"
-    session_key = "vylen:chat_a:user_1"
-    pending_event = FakeMessageEvent(
-        text="follow-up after stop",
-        source=FakeSessionSource(platform=adapter.platform, chat_id="chat_a", user_id="user_1"),
-        message_id="msg_pending",
-    )
-    adapter._active_turns_by_chat["chat_a"] = {
-        "turn_id": turn_id,
-        "message_id": "msg_user",
-        "session_key": session_key,
-    }
-
-    async def cancel_with_pending(key, **kwargs):
-        adapter.cancelled_sessions.append(key)
-        adapter.cancel_kwargs.append(dict(kwargs))
-        adapter._pending_messages[key] = pending_event
-
-    adapter.cancel_session_processing = cancel_with_pending
-
-    await adapter._handle_chat_action({
-        "type": "chat_action",
-        "request_id": "cancel_req_1",
-        "chat_id": "chat_a",
-        "turn_id": turn_id,
-        "action": "turn.cancel",
-    })
-
-    assert adapter.cancel_kwargs[-1] == {"discard_pending": False}
-    assert adapter._pending_messages == {}
-    assert adapter.started_sessions == [(session_key, pending_event)]
 
 
 @pytest.mark.asyncio

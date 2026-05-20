@@ -474,7 +474,12 @@ def make_adapter_class():
                 group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
                 thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             )
-            active = {"turn_id": turn_id, "message_id": user_message_id, "session_key": session_key}
+            active = {
+                "turn_id": turn_id,
+                "message_id": user_message_id,
+                "session_key": session_key,
+                "source": event.source,
+            }
             self._active_turns_by_chat[chat_id] = active
             task = asyncio.current_task()
             if task is not None:
@@ -865,8 +870,8 @@ def make_adapter_class():
                 if not turn_id or active is None or active.get("turn_id") != turn_id:
                     await self._send_chat_action_error(frame, "TURN_NOT_ACTIVE", "This turn is no longer active")
                     return
+                await self._dispatch_native_stop(chat_id, active)
                 self._cancel_active_turn(chat_id, active, reason="user_stop")
-                await self._cancel_session_and_drain_pending(str(active.get("session_key") or ""))
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
                     "request_id": request_id,
@@ -979,6 +984,22 @@ def make_adapter_class():
                 message_id=user_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+            )
+
+        def _build_command_event(self, *, source: Any, text: str, turn_id: str):
+            from gateway.platforms.base import MessageEvent, MessageType
+
+            raw_message = {
+                "text": text,
+                "turn_id": turn_id,
+                "native_action": True,
+            }
+            return MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=raw_message,
+                message_id=_message_id("command"),
             )
 
         async def _register_decoded_attachment_urls(self, attachment_result: dict[str, list[Any]]) -> None:
@@ -1116,20 +1137,15 @@ def make_adapter_class():
             if current and current.get("turn_id") == turn_id:
                 self._active_turns_by_chat.pop(chat_id, None)
 
-        async def _cancel_session_and_drain_pending(self, session_key: str) -> None:
-            if not session_key:
+        async def _dispatch_native_stop(self, chat_id: str, active: dict[str, Any]) -> None:
+            source = active.get("source")
+            if source is None:
                 return
-            await self.cancel_session_processing(session_key, discard_pending=False)
-            pending_messages = getattr(self, "_pending_messages", None)
-            if not isinstance(pending_messages, dict):
-                return
-            pending_event = pending_messages.pop(session_key, None)
-            if pending_event is None:
-                return
-            start_processing = getattr(self, "_start_session_processing", None)
-            if callable(start_processing) and start_processing(pending_event, session_key):
-                return
-            await self.handle_message(pending_event)
+            await self.handle_message(self._build_command_event(
+                source=source,
+                text="/stop",
+                turn_id=str(active.get("turn_id") or ""),
+            ))
 
         def _emit_tool_progress(
             self,
