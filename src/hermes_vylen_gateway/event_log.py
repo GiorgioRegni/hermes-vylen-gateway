@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -19,6 +19,13 @@ class ResumeExpired(Exception):
         super().__init__("resume cursor is older than retained events")
         self.floor_seq = floor_seq
         self.latest_seq = latest_seq
+
+
+class EventTooLarge(Exception):
+    def __init__(self, size_bytes: int, max_bytes: int) -> None:
+        super().__init__("event is larger than retained-event byte budget")
+        self.size_bytes = size_bytes
+        self.max_bytes = max_bytes
 
 
 @dataclass(frozen=True)
@@ -87,12 +94,13 @@ class RetainedEventLog:
 
     def append(self, kind: str, payload: Any, *, now: float | None = None) -> RetainedEvent:
         ts = float(self._now() if now is None else now)
+        size_bytes = self.ensure_fits(kind, payload)
         event = RetainedEvent(
             seq=self._next_seq,
             kind=kind,
             payload=payload,
             created_at=ts,
-            size_bytes=_payload_size(kind, payload),
+            size_bytes=size_bytes,
         )
         self._next_seq += 1
         self.updated_at = ts
@@ -101,6 +109,12 @@ class RetainedEventLog:
         self._evict(now=ts)
         self._bump()
         return event
+
+    def ensure_fits(self, kind: str, payload: Any) -> int:
+        size_bytes = _payload_size(kind, payload)
+        if size_bytes > self.max_bytes:
+            raise EventTooLarge(size_bytes, self.max_bytes)
+        return size_bytes
 
     def close(self) -> None:
         self._closed = True
@@ -170,13 +184,15 @@ class EventLogRegistry:
         ttl_seconds: float = DEFAULT_CHAT_CURSOR_TTL_SECONDS,
         max_events: int = DEFAULT_CHAT_CURSOR_MAX_EVENTS,
         max_bytes: int = DEFAULT_CHAT_CURSOR_MAX_BYTES,
+        max_logs: int = 1000,
         now: Any = time.time,
     ) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_events = max_events
         self.max_bytes = max_bytes
+        self.max_logs = max(1, max_logs)
         self._now = now
-        self._logs: dict[str, RetainedEventLog] = {}
+        self._logs: OrderedDict[str, RetainedEventLog] = OrderedDict()
         self._cursors: dict[tuple[str, str], int] = {}
 
     def get_or_create(self, key: str) -> RetainedEventLog:
@@ -190,10 +206,16 @@ class EventLogRegistry:
                 now=self._now,
             )
             self._logs[key] = log
+            self._evict_logs()
+        else:
+            self._logs.move_to_end(key)
         return log
 
     def get(self, key: str) -> RetainedEventLog | None:
-        return self._logs.get(key)
+        log = self._logs.get(key)
+        if log is not None:
+            self._logs.move_to_end(key)
+        return log
 
     def drop(self, key: str) -> None:
         self._logs.pop(key, None)
@@ -202,6 +224,8 @@ class EventLogRegistry:
                 self._cursors.pop(cursor_key, None)
 
     def acknowledge(self, key: str, client_id: str, seq: int) -> None:
+        if key in self._logs:
+            self._logs.move_to_end(key)
         cursor_key = (key, client_id)
         self._cursors[cursor_key] = max(seq, self._cursors.get(cursor_key, 0))
 
@@ -220,10 +244,22 @@ class EventLogRegistry:
                 dropped.append(key)
         for key in dropped:
             self.drop(key)
+        self._evict_logs()
         return len(dropped)
 
     def __len__(self) -> int:
         return len(self._logs)
+
+    def _evict_logs(self) -> None:
+        while len(self._logs) > self.max_logs:
+            drop_key = None
+            for key, log in self._logs.items():
+                if log.active_tailers <= 0:
+                    drop_key = key
+                    break
+            if drop_key is None:
+                return
+            self.drop(drop_key)
 
 
 def _payload_size(kind: str, payload: Any) -> int:

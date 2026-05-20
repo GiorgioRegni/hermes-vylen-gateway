@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"init error: {exc}", file=sys.stderr)
             return 1
         if changed:
-            print(f"enabled vylen in {config_path}")
+            print(f"configured vylen in {config_path}")
         else:
             print(f"vylen already enabled in {config_path}")
         return 0
@@ -65,13 +65,28 @@ def enable_plugin(config_path: Path | None = None) -> tuple[bool, Path]:
         enabled = []
     if not isinstance(enabled, list):
         raise InitError(f"{path}: plugins.enabled must be a YAML list")
-    if "vylen" in enabled:
-        return False, path
+    changed = False
+    if "vylen" not in enabled:
+        enabled.append("vylen")
+        plugins["enabled"] = enabled
+        changed = True
 
-    enabled.append("vylen")
-    plugins["enabled"] = enabled
-    path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-    return True, path
+    display = cfg.setdefault("display", {})
+    if not isinstance(display, dict):
+        raise InitError(f"{path}: display must be a YAML object")
+    platforms = display.setdefault("platforms", {})
+    if not isinstance(platforms, dict):
+        raise InitError(f"{path}: display.platforms must be a YAML object")
+    vylen_display = platforms.setdefault("vylen", {})
+    if not isinstance(vylen_display, dict):
+        raise InitError(f"{path}: display.platforms.vylen must be a YAML object")
+    if vylen_display.get("streaming") is not True:
+        vylen_display["streaming"] = True
+        changed = True
+
+    if changed:
+        path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    return changed, path
 
 
 def _default_config_path() -> Path:

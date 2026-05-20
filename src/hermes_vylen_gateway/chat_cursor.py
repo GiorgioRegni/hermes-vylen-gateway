@@ -1,4 +1,4 @@
-"""Chat-level cursor subscribe/replay support for gateway push events."""
+"""Chat-level cursor subscribe/replay support for retained chat events."""
 
 from __future__ import annotations
 
@@ -39,8 +39,19 @@ class ChatCursorRelay:
         if not chat_id:
             return None
         frame.setdefault("event_id", _event_id())
-        event = self._logs.get_or_create(chat_id).append("push", dict(frame))
+        return self.append_event(chat_id, "push", dict(frame))
+
+    def append_event(self, chat_id: str, kind: str, payload: dict[str, Any]) -> int | None:
+        if self._disabled:
+            return None
+        clean_chat_id = _clean_id(str(chat_id or ""))
+        if not clean_chat_id or not kind:
+            return None
+        event = self._logs.get_or_create(clean_chat_id).append(kind, dict(payload))
         return event.seq
+
+    async def send_event(self, chat_id: str, kind: str, payload: dict[str, Any]) -> int | None:
+        return self.append_event(chat_id, kind, payload)
 
     async def send_push(self, frame: dict[str, Any]) -> int | None:
         if self._disabled:
@@ -56,6 +67,7 @@ class ChatCursorRelay:
             seq = log.next_seq
             frame["seq"] = seq
             frame.setdefault("event_id", _event_id())
+            log.ensure_fits("push", dict(frame))
             try:
                 await self._send(frame)
             except Exception:

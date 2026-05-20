@@ -237,6 +237,46 @@ def test_append_push_adds_restart_stable_event_id_to_retained_payload():
 
 
 @pytest.mark.asyncio
+async def test_chat_subscribe_replays_generic_retained_events():
+    sent: list[dict] = []
+
+    async def send(frame: dict) -> None:
+        sent.append(frame)
+
+    logs = EventLogRegistry()
+    relay = ChatCursorRelay(send, logs)
+
+    seq = relay.append_event("chat_a", "message.created", {
+        "message_id": "msg_1",
+        "role": "user",
+        "text": "hello",
+    })
+
+    assert seq == 1
+
+    await relay.handle_subscribe({
+        "type": "chat_subscribe",
+        "request_id": "req_phone",
+        "chat_id": "chat_a",
+        "client_id": "client_phone",
+        "after_seq": 0,
+    })
+    await asyncio.sleep(0)
+
+    events = [frame for frame in sent if frame["type"] == FRAME_CHAT_EVENT]
+    assert events[0]["event"] == {
+        "kind": "message.created",
+        "payload": {
+            "message_id": "msg_1",
+            "role": "user",
+            "text": "hello",
+        },
+    }
+
+    await relay.close()
+
+
+@pytest.mark.asyncio
 async def test_active_quiet_subscription_keeps_log_attached_through_sweep():
     clock = Clock()
     logs = EventLogRegistry(ttl_seconds=1, now=clock)

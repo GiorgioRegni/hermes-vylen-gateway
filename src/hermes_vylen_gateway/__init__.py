@@ -58,6 +58,8 @@ def register(ctx) -> None:
             "(get a token from the Vylen Cloud portal)."
         ),
         emoji="🚀",
+        allowed_users_env="VYLEN_ALLOWED_USERS",
+        allow_all_env="VYLEN_ALLOW_ALL_USERS",
         cron_deliver_env_var="VYLEN_HOME_CHAT_ID",
     )
 

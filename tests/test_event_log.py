@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from hermes_vylen_gateway.adapter import _sweep_loop
-from hermes_vylen_gateway.event_log import EventLogRegistry, ResumeExpired, RetainedEventLog
+from hermes_vylen_gateway.event_log import EventLogRegistry, EventTooLarge, ResumeExpired, RetainedEventLog
 
 
 class Clock:
@@ -94,6 +94,32 @@ def test_byte_eviction_bounds_retained_payloads():
 
     assert [event.seq for event in log.events] == [2]
     assert log.total_bytes <= 70
+
+
+def test_single_event_larger_than_byte_budget_is_rejected_without_advancing_seq():
+    log = RetainedEventLog("chat_a", max_bytes=20)
+
+    with pytest.raises(EventTooLarge) as exc:
+        log.append("event", {"text": "x" * 100})
+
+    assert exc.value.max_bytes == 20
+    assert log.events == ()
+    assert log.next_seq == 1
+
+
+def test_registry_max_logs_drops_least_recently_used_chat_and_cursors():
+    registry = EventLogRegistry(max_logs=2)
+    registry.get_or_create("chat_a").append("event", {"n": 1})
+    event_b = registry.get_or_create("chat_b").append("event", {"n": 2})
+    registry.acknowledge("chat_b", "client_phone", event_b.seq)
+    registry.get("chat_a")
+
+    registry.get_or_create("chat_c").append("event", {"n": 3})
+
+    assert registry.get("chat_a") is not None
+    assert registry.get("chat_b") is None
+    assert registry.get("chat_c") is not None
+    assert registry.cursor("chat_b", "client_phone") == 0
 
 
 def test_registry_sweep_drops_expired_empty_logs_and_cursors():
