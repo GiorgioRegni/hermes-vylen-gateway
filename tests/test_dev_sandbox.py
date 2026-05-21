@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_dev_firebase_preserves_persistent_container_pairing():
-    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    makefile_path = REPO_ROOT / "Makefile"
+    if not makefile_path.exists():
+        pytest.skip("private monorepo Makefile is not present in the public package repo")
+    makefile = makefile_path.read_text(encoding="utf-8")
     dev_firebase = makefile.split("\ndev-firebase:\n", 1)[1].split("\n\ndev-cloud-firebase:", 1)[0]
     target = makefile.split("\ndev-hermes-up:\n", 1)[1].split("\n\ndev-hermes-pair:", 1)[0]
 
@@ -24,7 +29,10 @@ def test_dev_firebase_preserves_persistent_container_pairing():
 
 
 def test_dev_hermes_compose_does_not_enable_global_allow_all_users():
-    compose = (REPO_ROOT / "dev" / "hermes-compose.yml").read_text(encoding="utf-8")
+    compose_path = REPO_ROOT / "dev" / "hermes-compose.yml"
+    if not compose_path.exists():
+        pytest.skip("private monorepo dev compose file is not present in the public package repo")
+    compose = compose_path.read_text(encoding="utf-8")
 
     assert "GATEWAY_ALLOW_ALL_USERS" not in compose
     assert "VYLEN_ALLOW_ALL_USERS" not in compose
