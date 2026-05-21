@@ -754,6 +754,7 @@ async def test_session_controls_action_emits_model_and_reasoning_state(adapter):
 @pytest.mark.asyncio
 async def test_session_reasoning_action_dispatches_hermes_reasoning_command(adapter):
     dispatched: list[str] = []
+    dispatch_kwargs: list[dict[str, Any]] = []
     runner = types.SimpleNamespace(_session_reasoning_overrides={})
     runner._resolve_session_agent_runtime = (
         lambda **kwargs: ("gpt-5.5", {"provider": "openai-codex"})
@@ -767,6 +768,7 @@ async def test_session_reasoning_action_dispatches_hermes_reasoning_command(adap
 
     async def dispatch(frame, chat_id, text, **kwargs):
         dispatched.append(text)
+        dispatch_kwargs.append(dict(kwargs))
         runner._session_reasoning_overrides["vylen:chat_a:user_1"] = {"enabled": True, "effort": "xhigh"}
         return True
 
@@ -783,11 +785,54 @@ async def test_session_reasoning_action_dispatches_hermes_reasoning_command(adap
     })
 
     assert dispatched == ["/reasoning xhigh"]
+    assert dispatch_kwargs[-1].get("wait_for_completion") is True
     events = adapter._chat_event_logs.get("chat_a").events
     controls_events = [event for event in events if event.kind == "session.controls"]
     assert controls_events[-1].payload["reasoning_effort"] == "xhigh"
     action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
     assert action_acks[-1]["request_id"] == "reasoning_req"
+
+
+@pytest.mark.asyncio
+async def test_session_reasoning_action_does_not_wait_for_active_session(adapter):
+    dispatched: list[str] = []
+    dispatch_kwargs: list[dict[str, Any]] = []
+    session_key = "vylen:chat_a:user_1"
+    active_task = asyncio.create_task(asyncio.sleep(60))
+    adapter._session_tasks = {session_key: active_task}
+    runner = types.SimpleNamespace(_session_reasoning_overrides={})
+    runner._resolve_session_agent_runtime = (
+        lambda **kwargs: ("gpt-5.5", {"provider": "openai-codex"})
+    )
+    runner._resolve_session_reasoning_config = lambda **kwargs: {"enabled": True, "effort": "medium"}
+    adapter._runner = runner
+
+    async def dispatch(frame, chat_id, text, **kwargs):
+        dispatched.append(text)
+        dispatch_kwargs.append(dict(kwargs))
+        return True
+
+    adapter._dispatch_native_command = dispatch
+    adapter._load_show_reasoning = lambda: False
+
+    try:
+        await adapter._handle_chat_action({
+            "type": "chat_action",
+            "request_id": "reasoning_active_req",
+            "chat_id": "chat_a",
+            "action": "session.reasoning",
+            "text": "high",
+            "user_id": "user_1",
+        })
+    finally:
+        active_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await active_task
+
+    assert dispatched == ["/reasoning high"]
+    assert dispatch_kwargs[-1].get("wait_for_completion") is False
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "reasoning_active_req"
 
 
 @pytest.mark.asyncio

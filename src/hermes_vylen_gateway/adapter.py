@@ -1281,13 +1281,16 @@ def make_adapter_class():
                     await self._send_chat_action_error(frame, "SESSION_REASONING_INVALID", "Unsupported reasoning value")
                     return
                 command_value = "show" if value == "on" else "hide" if value == "off" else value
+                source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
+                session_key = self._session_key_for_source(source) if source is not None else ""
+                wait_for_reasoning = not self._session_task_running(session_key)
                 try:
                     dispatched = await self._dispatch_native_command(
                         frame,
                         chat_id,
                         f"/reasoning {command_value}",
                         suppress_confirm=False,
-                        wait_for_completion=True,
+                        wait_for_completion=wait_for_reasoning,
                     )
                 except Exception as exc:  # noqa: BLE001
                     await self._send_chat_action_error(frame, "SESSION_REASONING_FAILED", str(exc))
@@ -1295,7 +1298,6 @@ def make_adapter_class():
                 if not dispatched:
                     await self._send_chat_action_error(frame, "SESSION_SOURCE_UNAVAILABLE", "Could not route reasoning command")
                     return
-                source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
                 self._append_session_controls(chat_id, source=source)
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
@@ -1743,6 +1745,12 @@ def make_adapter_class():
                 await asyncio.wait_for(asyncio.shield(task), timeout=min(self._action_ttl_seconds, 30.0))
             except asyncio.TimeoutError as exc:
                 raise RuntimeError("Timed out waiting for native command completion") from exc
+
+        def _session_task_running(self, session_key: str) -> bool:
+            if not session_key:
+                return False
+            task = getattr(self, "_session_tasks", {}).get(session_key)
+            return bool(task is not None and task is not asyncio.current_task() and not task.done())
 
         def _source_for_chat(self, chat_id: str):
             active = self._active_turns_by_chat.get(chat_id)
