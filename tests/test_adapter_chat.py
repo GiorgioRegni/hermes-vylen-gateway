@@ -353,6 +353,26 @@ async def test_session_status_action_uses_requesting_user_source(adapter):
 
 
 @pytest.mark.asyncio
+async def test_session_status_action_returns_error_when_dispatch_fails(adapter):
+    async def fail_dispatch(*args, **kwargs):
+        raise RuntimeError("status failed")
+
+    adapter._dispatch_native_command = fail_dispatch
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "status_req_failure",
+        "chat_id": "chat_a",
+        "action": "session.status",
+    })
+
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["request_id"] == "status_req_failure"
+    assert errors[-1]["code"] == "SESSION_STATUS_FAILED"
+    assert not any(frame["type"] == "chat_action_ack" for frame in adapter._fake_client.sent)
+
+
+@pytest.mark.asyncio
 async def test_session_reset_action_retains_divider_and_dispatches_slash_reset(adapter):
     handled: list[str] = []
 
@@ -674,6 +694,22 @@ async def test_typed_status_slash_uses_native_status_semantics(adapter):
     )
     acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_ack"]
     assert acks[-1]["client_message_id"] == "client_msg_1"
+
+
+@pytest.mark.asyncio
+async def test_typed_status_slash_failure_removes_dedup_record(adapter):
+    async def fail_dispatch(*args, **kwargs):
+        raise RuntimeError("status failed")
+
+    adapter._dispatch_native_command = fail_dispatch
+    frame = _chat_message_frame(text="/status")
+
+    await adapter._handle_chat_message(frame)
+
+    errors = [sent for sent in adapter._fake_client.sent if sent["type"] == "chat_message_error"]
+    assert errors[-1]["request_id"] == "req_1"
+    assert errors[-1]["code"] == "SESSION_STATUS_FAILED"
+    assert ("chat_a", "client_msg_1") not in adapter._accepted_chat_messages
 
 
 @pytest.mark.asyncio

@@ -932,7 +932,12 @@ def make_adapter_class():
 
             if text == "/status":
                 self._append_session_status(chat_id, source=source)
-                await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
+                try:
+                    await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
+                except Exception as exc:  # noqa: BLE001
+                    self._accepted_chat_messages.pop(dedup_key, None)
+                    await self._send_chat_message_error(frame, "SESSION_STATUS_FAILED", str(exc))
+                    return
             else:
                 active = self._active_turns_by_chat.get(chat_id)
                 if active is not None:
@@ -1003,7 +1008,11 @@ def make_adapter_class():
             if action == "session.status":
                 source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
                 self._append_session_status(chat_id, source=source)
-                await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
+                try:
+                    await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
+                except Exception as exc:  # noqa: BLE001
+                    await self._send_chat_action_error(frame, "SESSION_STATUS_FAILED", str(exc))
+                    return
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
                     "request_id": request_id,
