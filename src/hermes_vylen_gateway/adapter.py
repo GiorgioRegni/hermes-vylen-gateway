@@ -166,6 +166,7 @@ def make_adapter_class():
             self._turns_by_task: dict[asyncio.Task, dict[str, Any]] = {}
             self._cancelled_turns: set[str] = set()
             self._suppress_response_tasks: set[asyncio.Task] = set()
+            self._native_confirm_sessions: dict[str, dict[str, Any]] = {}
             self._chat_message_tasks: set[asyncio.Task] = set()
             self._assistant_turn_by_message: dict[str, str] = {}
             self._assistant_messages_by_turn: dict[str, set[str]] = {}
@@ -349,7 +350,10 @@ def make_adapter_class():
             from gateway.platforms.base import SendResult
 
             current_task = asyncio.current_task()
-            if current_task is not None and current_task in self._suppress_response_tasks:
+            if (
+                (current_task is not None and current_task in self._suppress_response_tasks)
+                or str(reply_to or "").startswith("msg_command_")
+            ):
                 return SendResult(success=True, message_id=_message_id("suppressed"))
 
             task_turn = self._turns_by_task.get(asyncio.current_task())
@@ -608,6 +612,17 @@ def make_adapter_class():
             confirm_id: str,
             metadata: Optional[dict[str, Any]] = None,
         ):
+            if self._consume_native_confirm_session(session_key, confirm_id):
+                from gateway.platforms.base import SendResult
+                from tools import slash_confirm as _slash_confirm_mod
+
+                await _slash_confirm_mod.resolve(
+                    session_key,
+                    confirm_id,
+                    "once",
+                    timeout=self._action_ttl_seconds,
+                )
+                return SendResult(success=True, message_id=_message_id("confirm"))
             return self._create_action_card(
                 chat_id=chat_id,
                 kind="confirm",
@@ -730,6 +745,7 @@ def make_adapter_class():
             payload: dict[str, Any],
             message_prefix: str,
             action_id: str | None = None,
+            record_extra: dict[str, Any] | None = None,
         ):
             from gateway.platforms.base import SendResult
 
@@ -748,6 +764,8 @@ def make_adapter_class():
                 "expires_at": expires_at,
                 "expired_emitted": False,
             }
+            if record_extra:
+                record.update(record_extra)
             self._action_cards[resolved_action_id] = record
             self._action_cards.move_to_end(resolved_action_id)
             while len(self._action_cards) > 1000:
@@ -760,6 +778,8 @@ def make_adapter_class():
                 "created_at": _utc_iso(now),
                 "expires_at": _utc_iso(expires_at),
             }
+            if kind == "confirm" and not retained_payload.get("confirm_id"):
+                retained_payload["confirm_id"] = resolved_action_id
             self._append_chat_event(str(chat_id), event_kind, retained_payload)
             return SendResult(success=True, message_id=message_id)
 
@@ -793,6 +813,19 @@ def make_adapter_class():
                 await self._send_chat_message_error(frame, "INVALID_ATTACHMENT", str(exc))
                 return
 
+            text = frame.get("text")
+            text = text if isinstance(text, str) else ""
+            attachments = attachment_result["public"]
+            if not attachments and text.strip() in {"/status", "/reset"}:
+                await self._handle_native_chat_command(
+                    frame=frame,
+                    chat_id=chat_id,
+                    client_message_id=client_message_id,
+                    text=text.strip(),
+                    dedup_key=dedup_key,
+                    request_id=request_id,
+                )
+                return
             turn_id = f"turn_{uuid.uuid4().hex}"
             user_message_id = _message_id("user")
             accepted = {
@@ -804,14 +837,10 @@ def make_adapter_class():
             self._accepted_chat_messages.move_to_end(dedup_key)
             while len(self._accepted_chat_messages) > self._accepted_chat_messages_max:
                 self._accepted_chat_messages.popitem(last=False)
-
-            text = frame.get("text")
-            text = text if isinstance(text, str) else ""
             author = {
                 "id": user_id,
                 "name": str(frame.get("user_name") or user_id),
             }
-            attachments = attachment_result["public"]
             try:
                 self._append_chat_event(chat_id, "message.created", {
                     "message_id": user_message_id,
@@ -839,6 +868,7 @@ def make_adapter_class():
                 media_urls=attachment_result["paths"],
                 media_types=attachment_result["types"],
             )
+            accepted["source"] = event.source
             self._active_turns_by_chat[chat_id] = self._active_turn_for_event(event)
 
             await self._send_frame({
@@ -876,6 +906,70 @@ def make_adapter_class():
                     "updated_at": _utc_iso(),
                 })
 
+        async def _handle_native_chat_command(
+            self,
+            *,
+            frame: dict[str, Any],
+            chat_id: str,
+            client_message_id: str,
+            text: str,
+            dedup_key: tuple[str, str],
+            request_id: str,
+        ) -> None:
+            turn_id = _message_id("command_turn")
+            source = self._source_for_chat(chat_id) or self._source_for_chat_action(frame, chat_id)
+            accepted = {
+                "turn_id": turn_id,
+                "user_message_id": _message_id("command"),
+                "accepted_at": time.time(),
+            }
+            if source is not None:
+                accepted["source"] = source
+            self._accepted_chat_messages[dedup_key] = accepted
+            self._accepted_chat_messages.move_to_end(dedup_key)
+            while len(self._accepted_chat_messages) > self._accepted_chat_messages_max:
+                self._accepted_chat_messages.popitem(last=False)
+
+            if text == "/status":
+                self._append_session_status(chat_id)
+                await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
+            else:
+                active = self._active_turns_by_chat.get(chat_id)
+                if active is not None:
+                    self._accepted_chat_messages.pop(dedup_key, None)
+                    await self._send_chat_message_error(frame, "TURN_ACTIVE", "Stop the current run first")
+                    return
+                if source is None:
+                    self._accepted_chat_messages.pop(dedup_key, None)
+                    await self._send_chat_message_error(frame, "SESSION_SOURCE_UNAVAILABLE", "Could not route session reset")
+                    return
+                self._create_action_card(
+                    chat_id=chat_id,
+                    kind="confirm",
+                    event_kind="confirm.requested",
+                    session_key=self._session_key_for_source(source),
+                    payload={
+                        "title": "Reset chat history",
+                        "message": "Hermes will forget the conversation above. Your messages stay visible to you.",
+                        "choices": ["once", "cancel"],
+                        "confirm_id": "",
+                    },
+                    message_prefix="confirm",
+                    record_extra={
+                        "native_action": "session.reset",
+                        "source": source,
+                    },
+                )
+
+            await self._send_frame({
+                "type": FRAME_CHAT_MESSAGE_ACK,
+                "request_id": request_id,
+                "chat_id": chat_id,
+                "client_message_id": client_message_id,
+                "turn_id": turn_id,
+                "accepted": True,
+            })
+
         async def _handle_chat_action(self, frame: dict[str, Any]) -> None:
             request_id = _safe_id(frame.get("request_id"))
             chat_id = _safe_id(frame.get("chat_id"))
@@ -903,6 +997,45 @@ def make_adapter_class():
                     "request_id": request_id,
                     "chat_id": chat_id,
                     "turn_id": turn_id,
+                    "accepted": True,
+                })
+                return
+            if action == "session.status":
+                self._append_session_status(chat_id)
+                await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
+                await self._send_frame({
+                    "type": FRAME_CHAT_ACTION_ACK,
+                    "request_id": request_id,
+                    "chat_id": chat_id,
+                    "accepted": True,
+                })
+                return
+            if action == "session.reset":
+                active = self._active_turns_by_chat.get(chat_id)
+                if active is not None:
+                    await self._send_chat_action_error(frame, "TURN_ACTIVE", "Stop the current run first")
+                    return
+                dispatched = await self._dispatch_native_command(
+                    frame,
+                    chat_id,
+                    "/reset",
+                    suppress_confirm=True,
+                    expected_confirm_commands={"new"},
+                    wait_for_completion=True,
+                )
+                if not dispatched:
+                    await self._send_chat_action_error(frame, "SESSION_SOURCE_UNAVAILABLE", "Could not route session reset")
+                    return
+                self._append_chat_event(chat_id, "session.reset", {
+                    "message_id": _message_id("reset"),
+                    "text": "Cleared history",
+                    "cleared_at": _utc_iso(),
+                })
+                self._append_session_status(chat_id)
+                await self._send_frame({
+                    "type": FRAME_CHAT_ACTION_ACK,
+                    "request_id": request_id,
+                    "chat_id": chat_id,
                     "accepted": True,
                 })
                 return
@@ -940,6 +1073,33 @@ def make_adapter_class():
                         self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="resolver_lost")
                         await self._send_chat_action_error(frame, "STALE_ACTION", "This approval is no longer available")
                         return
+                elif record.get("native_action") == "session.reset":
+                    if choice != "cancel":
+                        active = self._active_turns_by_chat.get(chat_id)
+                        if active is not None:
+                            await self._send_chat_action_error(frame, "TURN_ACTIVE", "Stop the current run first")
+                            return
+                        dispatched = await self._dispatch_native_command(
+                            frame,
+                            chat_id,
+                            "/reset",
+                            suppress_confirm=True,
+                            expected_confirm_commands={"new"},
+                            wait_for_completion=True,
+                        )
+                        if not dispatched:
+                            await self._send_chat_action_error(
+                                frame,
+                                "SESSION_SOURCE_UNAVAILABLE",
+                                "Could not route session reset",
+                            )
+                            return
+                        self._append_chat_event(chat_id, "session.reset", {
+                            "message_id": _message_id("reset"),
+                            "text": "Cleared history",
+                            "cleared_at": _utc_iso(),
+                        })
+                        self._append_session_status(chat_id)
                 else:
                     from tools import slash_confirm as _slash_confirm_mod
 
@@ -1204,6 +1364,163 @@ def make_adapter_class():
             finally:
                 if task is not None:
                     self._suppress_response_tasks.discard(task)
+
+        async def _dispatch_native_command(
+            self,
+            frame: dict[str, Any],
+            chat_id: str,
+            text: str,
+            *,
+            suppress_confirm: bool,
+            expected_confirm_commands: set[str] | None = None,
+            wait_for_completion: bool = False,
+        ) -> bool:
+            source = self._source_for_chat(chat_id) or self._source_for_chat_action(frame, chat_id)
+            if source is None:
+                return False
+            session_key = self._session_key_for_source(source)
+            task = asyncio.current_task()
+            if task is not None:
+                self._suppress_response_tasks.add(task)
+            if suppress_confirm and session_key:
+                self._native_confirm_sessions[session_key] = {
+                    "deadline": time.time() + self._action_ttl_seconds,
+                    "commands": set(expected_confirm_commands or ()),
+                }
+            try:
+                await self.handle_message(self._build_command_event(
+                    source=source,
+                    text=text,
+                    turn_id="",
+                ))
+                if wait_for_completion and session_key:
+                    await self._wait_for_native_command_completion(session_key)
+            finally:
+                if task is not None:
+                    self._suppress_response_tasks.discard(task)
+                if wait_for_completion and suppress_confirm and session_key:
+                    self._native_confirm_sessions.pop(session_key, None)
+            return True
+
+        async def _wait_for_native_command_completion(self, session_key: str) -> None:
+            task = getattr(self, "_session_tasks", {}).get(session_key)
+            if task is None or task is asyncio.current_task():
+                return
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=min(self._action_ttl_seconds, 30.0))
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Timed out waiting for native command completion") from exc
+
+        def _source_for_chat(self, chat_id: str):
+            active = self._active_turns_by_chat.get(chat_id)
+            if active is not None and active.get("source") is not None:
+                return active.get("source")
+            for accepted in reversed(self._accepted_chat_messages.values()):
+                source = accepted.get("source")
+                if source is not None and str(getattr(source, "chat_id", "") or "") == chat_id:
+                    return source
+            return None
+
+        def _source_for_chat_action(self, frame: dict[str, Any], chat_id: str):
+            user_id = str(frame.get("user_id") or "")
+            if not user_id:
+                return None
+            from gateway.session import SessionSource
+
+            return SessionSource(
+                platform=self.platform,
+                chat_id=chat_id,
+                chat_name=str(frame.get("chat_name") or chat_id),
+                chat_type="dm",
+                user_id=user_id,
+                user_name=str(frame.get("user_name") or user_id),
+                message_id=_message_id("command"),
+            )
+
+        def _session_key_for_source(self, source: Any) -> str:
+            from gateway.session import build_session_key
+
+            return build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
+
+        def _append_session_status(self, chat_id: str) -> None:
+            active = self._active_turns_by_chat.get(chat_id)
+            source = self._source_for_chat(chat_id)
+            session_key = self._session_key_for_source(source) if source is not None else ""
+            active_turn_id = str((active or {}).get("turn_id") or "")
+            running_activities = [
+                activity_id
+                for activity_id in self._activity_ids_by_turn.get(active_turn_id, set())
+                if self._activity_status_by_id.get(activity_id) == "running"
+            ] if active_turn_id else []
+            queued, queued_exact = self._queue_depth_for_session(session_key)
+            self._append_chat_event(chat_id, "session.status", {
+                "status_id": _message_id("status"),
+                "state": "running" if active_turn_id else ("queued" if queued else "idle"),
+                "running": bool(active_turn_id),
+                "turn_id": active_turn_id,
+                "running_activities": len(running_activities),
+                "queued": queued,
+                "queued_exact": queued_exact,
+                "updated_at": _utc_iso(),
+            })
+
+        def _queue_depth_for_session(self, session_key: str) -> tuple[int, bool]:
+            if not session_key:
+                return 0, True
+            runner = getattr(self, "_runner", None)
+            if runner is None:
+                try:
+                    from gateway import run as gateway_run
+
+                    runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
+                    runner = runner_ref() if callable(runner_ref) else None
+                except Exception:  # noqa: BLE001
+                    runner = None
+            queue_depth = getattr(runner, "_queue_depth", None) if runner is not None else None
+            if callable(queue_depth):
+                try:
+                    return max(0, int(queue_depth(session_key, adapter=self))), True
+                except Exception:  # noqa: BLE001
+                    pass
+
+            queued = 1 if session_key in getattr(self, "_pending_messages", {}) else 0
+            queued_events = getattr(self, "_queued_events", None)
+            if isinstance(queued_events, dict):
+                queued += len(queued_events.get(session_key, []) or [])
+            return queued, queued == 0
+
+        def _consume_native_confirm_session(self, session_key: str, confirm_id: str) -> bool:
+            marker = self._native_confirm_sessions.get(session_key)
+            if marker is None:
+                return False
+            if isinstance(marker, dict):
+                deadline = float(marker.get("deadline") or 0)
+                expected_commands = set(marker.get("commands") or [])
+            else:
+                deadline = float(marker or 0)
+                expected_commands = set()
+            if deadline <= time.time():
+                self._native_confirm_sessions.pop(session_key, None)
+                return False
+            try:
+                from tools import slash_confirm as _slash_confirm_mod
+
+                pending = _slash_confirm_mod.get_pending(session_key)
+            except Exception:  # noqa: BLE001
+                pending = None
+            if not pending or str(pending.get("confirm_id") or "") != confirm_id:
+                self._native_confirm_sessions.pop(session_key, None)
+                return False
+            pending_command = str(pending.get("command") or "")
+            if expected_commands and pending_command not in expected_commands:
+                self._native_confirm_sessions.pop(session_key, None)
+                return False
+            self._native_confirm_sessions.pop(session_key, None)
+            return True
 
         def _active_turn_for_event(self, event) -> dict[str, Any]:
             from gateway.session import build_session_key

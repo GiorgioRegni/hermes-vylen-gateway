@@ -4,6 +4,7 @@ import base64
 import asyncio
 import os
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from typing import Any
@@ -279,6 +280,365 @@ async def test_turn_cancel_accepts_acknowledged_turn_before_processing_starts(ad
     release.set()
     if adapter._chat_message_tasks:
         await asyncio.gather(*tuple(adapter._chat_message_tasks))
+
+
+@pytest.mark.asyncio
+async def test_session_status_action_emits_retained_status_without_ack_bubble(adapter):
+    async def initial_handler(event):
+        return "pong"
+
+    adapter.set_message_handler(initial_handler)
+    await adapter._handle_chat_message(_chat_message_frame())
+
+    async def handler(event):
+        assert event.text == "/status"
+        return "status text that should be suppressed"
+
+    adapter.set_message_handler(handler)
+    adapter._fake_client.sent.clear()
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "status_req",
+        "chat_id": "chat_a",
+        "action": "session.status",
+    })
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    status_events = [event for event in events if event.kind == "session.status"]
+    assert status_events
+    assert status_events[-1].payload["state"] == "idle"
+    assert not any(
+        event.kind == "message.created" and event.payload.get("text") == "status text that should be suppressed"
+        for event in events
+    )
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "status_req"
+
+
+@pytest.mark.asyncio
+async def test_session_reset_action_retains_divider_and_dispatches_slash_reset(adapter):
+    handled: list[str] = []
+
+    async def initial_handler(event):
+        return "pong"
+
+    adapter.set_message_handler(initial_handler)
+    await adapter._handle_chat_message(_chat_message_frame())
+
+    async def handler(event):
+        handled.append(event.text)
+        return "reset text that should be suppressed"
+
+    adapter.set_message_handler(handler)
+    adapter._fake_client.sent.clear()
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "reset_req",
+        "chat_id": "chat_a",
+        "action": "session.reset",
+    })
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert "/reset" in handled
+    assert [event.kind for event in events].count("session.reset") == 1
+    assert not any(
+        event.kind == "message.created" and event.payload.get("text") == "reset text that should be suppressed"
+        for event in events
+    )
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "reset_req"
+
+
+@pytest.mark.asyncio
+async def test_session_reset_action_builds_source_without_prior_message(adapter):
+    handled: list[Any] = []
+
+    async def handler(event):
+        handled.append(event)
+        return None
+
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "reset_req_empty",
+        "chat_id": "chat_empty",
+        "action": "session.reset",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+    })
+
+    assert [event.text for event in handled] == ["/reset"]
+    assert handled[0].source.chat_id == "chat_empty"
+    assert handled[0].source.user_id == "user_1"
+    assert [event.kind for event in adapter._chat_event_logs.get("chat_empty").events].count("session.reset") == 1
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "reset_req_empty"
+
+
+@pytest.mark.asyncio
+async def test_native_reset_confirm_marker_survives_until_slash_confirm(adapter, monkeypatch):
+    calls = _install_fake_approval_tools(monkeypatch)
+    adapter._native_confirm_sessions["session_a"] = time.time() + adapter._action_ttl_seconds
+
+    result = await adapter.send_slash_confirm(
+        chat_id="chat_a",
+        title="Confirm reset",
+        message="Proceed?",
+        session_key="session_a",
+        confirm_id="confirm_1",
+    )
+    await asyncio.sleep(0)
+
+    assert result.success
+    assert calls["confirm"] == [("session_a", "confirm_1", "once", adapter._action_ttl_seconds)]
+    assert "session_a" not in adapter._native_confirm_sessions
+    assert adapter._chat_event_logs.get("chat_a") is None
+
+
+@pytest.mark.asyncio
+async def test_session_status_reports_pending_slot_queue_depth(adapter):
+    async def handler(event):
+        return "pong"
+
+    adapter.set_message_handler(handler)
+    await adapter._handle_chat_message(_chat_message_frame())
+    adapter._fake_client.sent.clear()
+    adapter._pending_messages["vylen:chat_a:user_1"] = object()
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "status_req_queue",
+        "chat_id": "chat_a",
+        "action": "session.status",
+    })
+
+    status_events = [
+        event for event in adapter._chat_event_logs.get("chat_a").events
+        if event.kind == "session.status"
+    ]
+    assert status_events[-1].payload["queued"] == 1
+    assert status_events[-1].payload["queued_exact"] is False
+    assert status_events[-1].payload["state"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_session_reset_action_suppresses_delayed_background_confirm(adapter, monkeypatch):
+    calls = _install_fake_approval_tools(monkeypatch)
+    confirm_started = asyncio.Event()
+
+    async def delayed_handle_message(event):
+        adapter.handled_events.append(event)
+
+        async def later_confirm():
+            await asyncio.sleep(0)
+            await adapter.send_slash_confirm(
+                chat_id=event.source.chat_id,
+                title="Confirm reset",
+                message="Proceed?",
+                session_key=adapter._session_key_for_source(event.source),
+                confirm_id="confirm_1",
+            )
+            confirm_started.set()
+
+        session_key = adapter._session_key_for_source(event.source)
+        task = asyncio.create_task(later_confirm())
+        adapter._session_tasks = {session_key: task}
+
+    adapter.handle_message = delayed_handle_message
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "reset_req_background",
+        "chat_id": "chat_a",
+        "action": "session.reset",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+    })
+    await asyncio.wait_for(confirm_started.wait(), timeout=1)
+
+    assert calls["confirm"] == [("vylen:chat_a:user_1", "confirm_1", "once", adapter._action_ttl_seconds)]
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert not any(event.kind == "confirm.requested" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_session_reset_action_waits_for_background_command_completion(adapter, monkeypatch):
+    release_resolve = asyncio.Event()
+    resolve_started = asyncio.Event()
+    calls = _install_fake_approval_tools(monkeypatch, confirm_wait=release_resolve, confirm_started=resolve_started)
+    completed = asyncio.Event()
+
+    async def background_command(event):
+        await asyncio.sleep(0)
+        await adapter.send_slash_confirm(
+            chat_id=event.source.chat_id,
+            title="Confirm reset",
+            message="Proceed?",
+            session_key=adapter._session_key_for_source(event.source),
+            confirm_id="confirm_1",
+        )
+        completed.set()
+
+    async def background_handle_message(event):
+        adapter.handled_events.append(event)
+        session_key = adapter._session_key_for_source(event.source)
+        task = asyncio.create_task(background_command(event))
+        adapter._session_tasks = {session_key: task}
+
+    adapter.handle_message = background_handle_message
+
+    reset_task = asyncio.create_task(adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "reset_req_wait",
+        "chat_id": "chat_a",
+        "action": "session.reset",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+    }))
+    await asyncio.wait_for(resolve_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    events = adapter._chat_event_logs.get("chat_a")
+    assert events is None or [event.kind for event in events.events].count("session.reset") == 0
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks == []
+
+    release_resolve.set()
+    await reset_task
+
+    assert completed.is_set()
+    assert calls["confirm"] == [("vylen:chat_a:user_1", "confirm_1", "once", adapter._action_ttl_seconds)]
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert [event.kind for event in events].count("session.reset") == 1
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "reset_req_wait"
+
+
+@pytest.mark.asyncio
+async def test_native_reset_confirm_marker_does_not_auto_resolve_unrelated_confirm(adapter, monkeypatch):
+    calls = _install_fake_approval_tools(monkeypatch, pending_command="reload-mcp")
+    adapter._native_confirm_sessions["session_a"] = {
+        "deadline": time.time() + adapter._action_ttl_seconds,
+        "commands": {"new"},
+    }
+
+    result = await adapter.send_slash_confirm(
+        chat_id="chat_a",
+        title="Reload MCP",
+        message="Proceed?",
+        session_key="session_a",
+        confirm_id="confirm_1",
+    )
+    await asyncio.sleep(0)
+
+    assert result.success
+    assert calls["confirm"] == []
+    assert "session_a" not in adapter._native_confirm_sessions
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert [event.kind for event in events].count("confirm.requested") == 1
+
+
+@pytest.mark.asyncio
+async def test_session_status_uses_runner_queue_depth_when_available(adapter):
+    async def handler(event):
+        return "pong"
+
+    adapter.set_message_handler(handler)
+    await adapter._handle_chat_message(_chat_message_frame())
+    adapter._fake_client.sent.clear()
+    adapter._pending_messages["vylen:chat_a:user_1"] = object()
+    adapter._runner = types.SimpleNamespace(_queue_depth=lambda session_key, adapter=None: 3)
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "status_req_queue_depth",
+        "chat_id": "chat_a",
+        "action": "session.status",
+    })
+
+    status_events = [
+        event for event in adapter._chat_event_logs.get("chat_a").events
+        if event.kind == "session.status"
+    ]
+    assert status_events[-1].payload["queued"] == 3
+    assert status_events[-1].payload["queued_exact"] is True
+    assert status_events[-1].payload["state"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_typed_status_slash_uses_native_status_semantics(adapter):
+    async def handler(event):
+        assert event.text == "/status"
+        return "status text that should be suppressed"
+
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_chat_message(_chat_message_frame(text="/status"))
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert [event.kind for event in events].count("session.status") == 1
+    assert not any(
+        event.kind == "message.created" and event.payload.get("text") in {"/status", "status text that should be suppressed"}
+        for event in events
+    )
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_ack"]
+    assert acks[-1]["client_message_id"] == "client_msg_1"
+
+
+@pytest.mark.asyncio
+async def test_typed_reset_slash_requests_confirmation_before_reset(adapter):
+    handled: list[str] = []
+
+    async def handler(event):
+        handled.append(event.text)
+        return "reset text that should be suppressed"
+
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_chat_message(_chat_message_frame(text="/reset"))
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert handled == []
+    assert [event.kind for event in events].count("confirm.requested") == 1
+    assert [event.kind for event in events].count("session.reset") == 0
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_ack"]
+    assert acks[-1]["client_message_id"] == "client_msg_1"
+
+
+@pytest.mark.asyncio
+async def test_typed_reset_confirm_uses_native_reset_semantics(adapter):
+    handled: list[str] = []
+
+    async def handler(event):
+        handled.append(event.text)
+        return "reset text that should be suppressed"
+
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_chat_message(_chat_message_frame(text="/reset"))
+    action_id = next(iter(adapter._action_cards))
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "confirm_reset_req",
+        "chat_id": "chat_a",
+        "action": "confirm.respond",
+        "action_id": action_id,
+        "choice": "once",
+    })
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert handled == ["/reset"]
+    assert [event.kind for event in events].count("session.reset") == 1
+    assert not any(
+        event.kind == "message.created" and event.payload.get("text") in {"/reset", "reset text that should be suppressed"}
+        for event in events
+    )
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "confirm_reset_req"
 
 
 @pytest.mark.asyncio
@@ -864,12 +1224,23 @@ async def test_mismatched_chat_action_does_not_expire_other_chat_card(adapter):
     assert adapter._chat_event_logs.get("chat_b") is None
 
 
-def _install_fake_approval_tools(monkeypatch, *, approval_count: int = 1, confirm_follow_up: str | None = None):
+def _install_fake_approval_tools(
+    monkeypatch,
+    *,
+    approval_count: int = 1,
+    confirm_follow_up: str | None = None,
+    pending_command: str = "new",
+    confirm_wait: asyncio.Event | None = None,
+    confirm_started: asyncio.Event | None = None,
+):
     tools_mod = types.ModuleType("tools")
     approval_mod = types.ModuleType("tools.approval")
     slash_confirm_mod = types.ModuleType("tools.slash_confirm")
     calls: dict[str, list[tuple[Any, ...]]] = {"approval": [], "confirm": []}
-    pending_confirms: dict[str, dict[str, Any]] = {"session_a": {"confirm_id": "confirm_1"}}
+    pending_confirms: dict[str, dict[str, Any]] = {
+        "session_a": {"confirm_id": "confirm_1", "command": pending_command},
+        "vylen:chat_a:user_1": {"confirm_id": "confirm_1", "command": pending_command},
+    }
 
     def resolve_gateway_approval(session_key, choice):
         calls["approval"].append((session_key, choice))
@@ -880,6 +1251,10 @@ def _install_fake_approval_tools(monkeypatch, *, approval_count: int = 1, confir
         return dict(pending) if pending else None
 
     async def resolve(session_key, confirm_id, choice, timeout=300):
+        if confirm_started is not None:
+            confirm_started.set()
+        if confirm_wait is not None:
+            await confirm_wait.wait()
         calls["confirm"].append((session_key, confirm_id, choice, timeout))
         pending_confirms.pop(session_key, None)
         return confirm_follow_up
