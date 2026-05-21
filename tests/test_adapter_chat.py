@@ -572,7 +572,8 @@ async def test_turn_cancel_dispatch_failure_returns_error_and_keeps_turn_active(
     assert errors[-1]["code"] == "TURN_CANCEL_FAILED"
     assert adapter._active_turns_by_chat["chat_a"]["turn_id"] == turn_id
     assert turn_id not in adapter._cancelled_turns
-    events = adapter._chat_event_logs.get("chat_a").events
+    log = adapter._chat_event_logs.get("chat_a")
+    events = log.events if log else []
     assert not any(event.kind == "turn.cancelled" and event.payload["turn_id"] == turn_id for event in events)
 
 
