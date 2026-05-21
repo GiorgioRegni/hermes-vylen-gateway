@@ -218,12 +218,289 @@ async def test_chat_message_deduplicates_by_chat_and_client_message_id(adapter):
     assert acks[0]["turn_id"] == acks[1]["turn_id"]
     assert len(handled) == 1
 
-    user_echoes = [
-        event for event in adapter._chat_event_logs.get("chat_a").events
-        if event.kind == "message.created" and event.payload["role"] == "user"
+
+@pytest.mark.asyncio
+async def test_chat_message_during_active_run_queues_instead_of_interrupting(adapter):
+    handled: list[FakeMessageEvent] = []
+
+    async def handler(event):
+        handled.append(event)
+        return "pong"
+
+    adapter.set_message_handler(handler)
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": "turn_active", "message_id": "msg_active"}
+
+    await adapter._handle_chat_message(_chat_message_frame(text="follow up during run"))
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    created = [event for event in events if event.kind == "message.created"][-1]
+    queued = [event for event in events if event.kind == "turn.queued"]
+    assert created.payload["text"] == "follow up during run"
+    assert created.payload["status"] == "queued"
+    assert queued
+    assert handled == []
+    assert adapter._pending_messages
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_ack"]
+    assert len(acks) == 1
+
+
+@pytest.mark.asyncio
+async def test_message_queue_action_enqueues_followup(adapter):
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": "turn_active", "message_id": "msg_active"}
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "queue_req",
+        "chat_id": "chat_a",
+        "client_id": "phone",
+        "client_message_id": "client_queue_1",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+        "action": "message.queue",
+        "text": "queued follow-up",
+    })
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    created = [event for event in events if event.kind == "message.created"][-1]
+    assert created.payload["client_message_id"] == "client_queue_1"
+    assert created.payload["status"] == "queued"
+    assert created.payload["intent"] == "queue"
+    assert [event for event in events if event.kind == "turn.queued"]
+    assert adapter._pending_messages
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert len(acks) == 1
+    assert acks[0]["client_message_id"] == "client_queue_1"
+
+
+@pytest.mark.asyncio
+async def test_message_queue_action_is_idempotent(adapter):
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": "turn_active", "message_id": "msg_active"}
+    frame = {
+        "type": "chat_action",
+        "request_id": "queue_req",
+        "chat_id": "chat_a",
+        "client_id": "phone",
+        "client_message_id": "client_queue_1",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+        "action": "message.queue",
+        "text": "queued follow-up",
+    }
+
+    await adapter._handle_chat_action(dict(frame))
+    frame["request_id"] = "queue_req_retry"
+    await adapter._handle_chat_action(dict(frame))
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    created = [
+        event for event in events
+        if event.kind == "message.created" and event.payload.get("client_message_id") == "client_queue_1"
     ]
-    assert len(user_echoes) == 1
-    assert user_echoes[0].payload["client_message_id"] == "client_msg_1"
+    queued = [event for event in events if event.kind == "turn.queued"]
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert len(created) == 1
+    assert len(queued) == 1
+    assert len(acks) == 2
+    assert acks[0]["message_id"] == acks[1]["message_id"]
+    assert acks[1]["message_status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_message_queue_action_preserves_fifo_without_runner(adapter):
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": "turn_active", "message_id": "msg_active"}
+
+    for idx, text in enumerate(["first", "second", "third"], start=1):
+        await adapter._handle_chat_action({
+            "type": "chat_action",
+            "request_id": f"queue_req_{idx}",
+            "chat_id": "chat_a",
+            "client_id": "phone",
+            "client_message_id": f"client_queue_{idx}",
+            "user_id": "user_1",
+            "user_name": "Giorgio",
+            "action": "message.queue",
+            "text": text,
+        })
+
+    session_key = "vylen:chat_a:user_1"
+    assert adapter._pending_messages[session_key].text == "first"
+    assert [event.text for event in adapter._queued_events[session_key]] == ["second", "third"]
+
+    first = adapter._pending_messages.pop(session_key)
+    await adapter.on_processing_complete(first, types.SimpleNamespace(value="success"))
+    assert adapter._pending_messages[session_key].text == "second"
+    assert [event.text for event in adapter._queued_events[session_key]] == ["third"]
+
+
+@pytest.mark.asyncio
+async def test_message_steer_action_dispatches_slash_without_ack_bubble(adapter):
+    handled: list[str] = []
+
+    async def handler(event):
+        handled.append(event.text)
+        return "steer accepted"
+
+    adapter.set_message_handler(handler)
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": "turn_active", "message_id": "msg_active"}
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "steer_req",
+        "chat_id": "chat_a",
+        "client_id": "phone",
+        "client_message_id": "client_steer_1",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+        "action": "message.steer",
+        "text": "change direction",
+    })
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    user_messages = [
+        event for event in events
+        if event.kind == "message.created" and event.payload.get("role") == "user"
+    ]
+    hermes_messages = [
+        event for event in events
+        if event.kind == "message.created" and event.payload.get("role") == "hermes"
+    ]
+    assert user_messages[-1].payload["intent"] == "steer"
+    assert user_messages[-1].payload["status"] == "completed"
+    assert handled == ["/steer change direction"]
+    assert hermes_messages == []
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert len(acks) == 1
+
+
+@pytest.mark.asyncio
+async def test_message_steer_action_reconciles_fallback_queue(adapter):
+    session_key = "vylen:chat_a:user_1"
+
+    async def handler(event):
+        if event.text.startswith("/steer "):
+            adapter._pending_messages[session_key] = FakeMessageEvent(
+                text=event.text.removeprefix("/steer ").strip(),
+                source=event.source,
+                message_id=event.message_id,
+            )
+            return "Agent still starting — /steer queued for the next turn."
+        return "pong"
+
+    adapter.set_message_handler(handler)
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": "turn_active", "message_id": "msg_active"}
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "steer_req",
+        "chat_id": "chat_a",
+        "client_id": "phone",
+        "client_message_id": "client_steer_1",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+        "action": "message.steer",
+        "text": "change direction",
+    })
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    updates = [
+        event for event in events
+        if event.kind == "message.updated" and event.payload.get("intent") == "queue"
+    ]
+    assert updates[-1].payload["status"] == "queued"
+    assert adapter._pending_messages[session_key].text == "change direction"
+    assert adapter._pending_messages[session_key].message_id == updates[-1].payload["message_id"]
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert acks[-1]["intent"] == "queue"
+    assert acks[-1]["message_status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_message_steer_fallback_preserves_existing_queue_head(adapter):
+    session_key = "vylen:chat_a:user_1"
+    source = FakeSessionSource(
+        platform=adapter.platform,
+        chat_id="chat_a",
+        user_id="user_1",
+        user_name="Giorgio",
+        message_id="msg_first",
+    )
+    adapter._pending_messages[session_key] = FakeMessageEvent(
+        text="first",
+        source=source,
+        message_id="msg_first",
+    )
+
+    async def handler(event):
+        if event.text.startswith("/steer "):
+            adapter._pending_messages[session_key] = FakeMessageEvent(
+                text=event.text.removeprefix("/steer ").strip(),
+                source=event.source,
+                message_id=event.message_id,
+            )
+            return "No active agent — /steer queued for the next turn."
+        return "pong"
+
+    adapter.set_message_handler(handler)
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": "turn_active", "message_id": "msg_active"}
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "steer_req",
+        "chat_id": "chat_a",
+        "client_id": "phone",
+        "client_message_id": "client_steer_1",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+        "action": "message.steer",
+        "text": "second",
+    })
+
+    assert adapter._pending_messages[session_key].text == "first"
+    assert [event.text for event in adapter._queued_events[session_key]] == ["second"]
+
+
+@pytest.mark.asyncio
+async def test_message_steer_success_with_same_text_queue_head_stays_steer(adapter):
+    session_key = "vylen:chat_a:user_1"
+    source = FakeSessionSource(
+        platform=adapter.platform,
+        chat_id="chat_a",
+        user_id="user_1",
+        user_name="Giorgio",
+        message_id="msg_first",
+    )
+    existing = FakeMessageEvent(
+        text="second",
+        source=source,
+        message_id="msg_first",
+    )
+    adapter._pending_messages[session_key] = existing
+
+    async def handler(event):
+        if event.text.startswith("/steer "):
+            return "Steer queued"
+        return "pong"
+
+    adapter.set_message_handler(handler)
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": "turn_active", "message_id": "msg_active"}
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "steer_req",
+        "chat_id": "chat_a",
+        "client_id": "phone",
+        "client_message_id": "client_steer_1",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+        "action": "message.steer",
+        "text": "second",
+    })
+
+    assert adapter._pending_messages[session_key] is existing
+    assert getattr(adapter, "_queued_events", {}) == {}
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert acks[-1]["intent"] == "steer"
+    assert acks[-1]["message_status"] == "completed"
 
 
 @pytest.mark.asyncio

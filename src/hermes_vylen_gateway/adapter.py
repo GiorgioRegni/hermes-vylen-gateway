@@ -579,6 +579,7 @@ def make_adapter_class():
             active = self._active_turns_by_chat.get(chat_id)
             if active and active.get("turn_id") == turn_id:
                 self._active_turns_by_chat.pop(chat_id, None)
+            self._promote_local_queued_event(event)
 
         async def send_exec_approval(
             self,
@@ -801,6 +802,7 @@ def make_adapter_class():
                     "request_id": request_id,
                     "chat_id": chat_id,
                     "client_message_id": client_message_id,
+                    "message_id": existing.get("user_message_id"),
                     "turn_id": existing["turn_id"],
                     "accepted": True,
                 })
@@ -816,7 +818,7 @@ def make_adapter_class():
             text = frame.get("text")
             text = text if isinstance(text, str) else ""
             attachments = attachment_result["public"]
-            if not attachments and text.strip() in {"/status", "/reset"}:
+            if not attachments and _native_chat_command(text):
                 await self._handle_native_chat_command(
                     frame=frame,
                     chat_id=chat_id,
@@ -828,10 +830,21 @@ def make_adapter_class():
                 return
             turn_id = f"turn_{uuid.uuid4().hex}"
             user_message_id = _message_id("user")
+            event = self._build_message_event(
+                frame=frame,
+                chat_id=chat_id,
+                text=text,
+                user_message_id=user_message_id,
+                turn_id=turn_id,
+                media_urls=attachment_result["paths"],
+                media_types=attachment_result["types"],
+            )
+            queue_instead_of_interrupt = self._should_queue_new_message(chat_id, event)
             accepted = {
                 "turn_id": turn_id,
                 "user_message_id": user_message_id,
                 "accepted_at": time.time(),
+                "source": event.source,
             }
             self._accepted_chat_messages[dedup_key] = accepted
             self._accepted_chat_messages.move_to_end(dedup_key)
@@ -846,7 +859,7 @@ def make_adapter_class():
                     "message_id": user_message_id,
                     "role": "user",
                     "text": text,
-                    "status": "running",
+                    "status": "queued" if queue_instead_of_interrupt else "running",
                     "created_at": _utc_iso(),
                     "turn_id": turn_id,
                     "client_message_id": client_message_id,
@@ -859,26 +872,29 @@ def make_adapter_class():
                 await self._send_chat_message_error(frame, "CHAT_EVENT_TOO_LARGE", str(exc))
                 return
 
-            event = self._build_message_event(
-                frame=frame,
-                chat_id=chat_id,
-                text=text,
-                user_message_id=user_message_id,
-                turn_id=turn_id,
-                media_urls=attachment_result["paths"],
-                media_types=attachment_result["types"],
-            )
-            accepted["source"] = event.source
-            self._active_turns_by_chat[chat_id] = self._active_turn_for_event(event)
+            if queue_instead_of_interrupt:
+                self._append_chat_event(chat_id, "turn.queued", {
+                    "turn_id": turn_id,
+                    "message_id": user_message_id,
+                    "queued_at": _utc_iso(),
+                })
+                self._enqueue_message_event(event)
+                self._append_session_status(chat_id, source=event.source)
+            else:
+                self._active_turns_by_chat[chat_id] = self._active_turn_for_event(event)
 
             await self._send_frame({
                 "type": FRAME_CHAT_MESSAGE_ACK,
                 "request_id": request_id,
                 "chat_id": chat_id,
                 "client_message_id": client_message_id,
+                "message_id": user_message_id,
                 "turn_id": turn_id,
                 "accepted": True,
             })
+
+            if queue_instead_of_interrupt:
+                return
 
             task = asyncio.create_task(self._process_chat_message(chat_id, user_message_id, turn_id, event))
             self._chat_message_tasks.add(task)
@@ -918,6 +934,7 @@ def make_adapter_class():
         ) -> None:
             turn_id = _message_id("command_turn")
             source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
+            command, args = _split_native_chat_command(text)
             accepted = {
                 "turn_id": turn_id,
                 "user_message_id": _message_id("command"),
@@ -930,7 +947,7 @@ def make_adapter_class():
             while len(self._accepted_chat_messages) > self._accepted_chat_messages_max:
                 self._accepted_chat_messages.popitem(last=False)
 
-            if text == "/status":
+            if command == "status":
                 self._append_session_status(chat_id, source=source)
                 try:
                     await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
@@ -938,7 +955,7 @@ def make_adapter_class():
                     self._accepted_chat_messages.pop(dedup_key, None)
                     await self._send_chat_message_error(frame, "SESSION_STATUS_FAILED", str(exc))
                     return
-            else:
+            elif command == "reset":
                 active = self._active_turns_by_chat.get(chat_id)
                 if active is not None:
                     self._accepted_chat_messages.pop(dedup_key, None)
@@ -965,6 +982,36 @@ def make_adapter_class():
                         "source": source,
                     },
                 )
+            elif command == "queue":
+                self._accepted_chat_messages.pop(dedup_key, None)
+                frame = dict(frame)
+                frame["text"] = args
+                await self._handle_message_control_action(
+                    frame,
+                    chat_id=chat_id,
+                    request_id=request_id,
+                    client_message_id=client_message_id,
+                    control="queue",
+                    ack_type=FRAME_CHAT_MESSAGE_ACK,
+                )
+                return
+            elif command == "steer":
+                self._accepted_chat_messages.pop(dedup_key, None)
+                frame = dict(frame)
+                frame["text"] = args
+                await self._handle_message_control_action(
+                    frame,
+                    chat_id=chat_id,
+                    request_id=request_id,
+                    client_message_id=client_message_id,
+                    control="steer",
+                    ack_type=FRAME_CHAT_MESSAGE_ACK,
+                )
+                return
+            else:
+                self._accepted_chat_messages.pop(dedup_key, None)
+                await self._send_chat_message_error(frame, "CHAT_MESSAGE_INVALID", "unsupported native command")
+                return
 
             await self._send_frame({
                 "type": FRAME_CHAT_MESSAGE_ACK,
@@ -974,6 +1021,201 @@ def make_adapter_class():
                 "turn_id": turn_id,
                 "accepted": True,
             })
+
+        async def _handle_message_control_action(
+            self,
+            frame: dict[str, Any],
+            *,
+            chat_id: str,
+            request_id: str,
+            client_message_id: str,
+            control: str,
+            ack_type: str,
+        ) -> None:
+            dedup_key = (chat_id, client_message_id)
+            existing = self._accepted_chat_messages.get(dedup_key)
+            if existing is not None:
+                self._accepted_chat_messages.move_to_end(dedup_key)
+                await self._send_frame({
+                    "type": ack_type,
+                    "request_id": request_id,
+                    "chat_id": chat_id,
+                    "client_message_id": client_message_id,
+                    "message_id": existing.get("user_message_id"),
+                    "turn_id": existing.get("turn_id"),
+                    "intent": existing.get("intent"),
+                    "message_status": existing.get("message_status"),
+                    "accepted": True,
+                })
+                return
+
+            text = frame.get("text")
+            text = text if isinstance(text, str) else ""
+            text = text.strip()
+            try:
+                attachment_result = self._decode_attachments(frame.get("attachments"))
+                await self._register_decoded_attachment_urls(attachment_result)
+            except ValueError as exc:
+                await self._send_message_control_error(frame, ack_type, "INVALID_ATTACHMENT", str(exc))
+                return
+            if not text and not attachment_result["public"]:
+                await self._send_message_control_error(frame, ack_type, "CHAT_MESSAGE_INVALID", "text is required")
+                return
+            if control == "steer" and attachment_result["public"]:
+                await self._send_message_control_error(frame, ack_type, "STEER_ATTACHMENTS_UNSUPPORTED", "Steer only supports text")
+                return
+
+            user_message_id = _message_id("user")
+            turn_id = f"turn_{uuid.uuid4().hex}"
+            source = self._source_for_chat_action(frame, chat_id, message_id=user_message_id)
+            if source is None:
+                await self._send_message_control_error(
+                    frame,
+                    ack_type,
+                    "SESSION_SOURCE_UNAVAILABLE",
+                    "Could not route message",
+                )
+                return
+            event = self._build_message_event(
+                frame=frame,
+                chat_id=chat_id,
+                text=text,
+                user_message_id=user_message_id,
+                turn_id=turn_id,
+                media_urls=attachment_result["paths"],
+                media_types=attachment_result["types"],
+            )
+            if control == "steer" and not self._should_queue_new_message(chat_id, event):
+                control = "queue"
+            queued = control == "queue" and self._should_queue_new_message(chat_id, event)
+            status = "queued" if queued else ("completed" if control == "steer" else "running")
+            author = {
+                "id": str(frame.get("user_id") or ""),
+                "name": str(frame.get("user_name") or frame.get("user_id") or ""),
+            }
+            try:
+                self._append_chat_event(chat_id, "message.created", {
+                    "message_id": user_message_id,
+                    "role": "user",
+                    "text": text,
+                    "status": status,
+                    "created_at": _utc_iso(),
+                    "turn_id": turn_id,
+                    "client_message_id": client_message_id,
+                    "origin_client_id": str(frame.get("client_id") or ""),
+                    "author": author,
+                    "attachments": attachment_result["public"],
+                    "intent": control,
+                })
+            except Exception as exc:  # noqa: BLE001
+                await self._send_message_control_error(frame, ack_type, "CHAT_EVENT_TOO_LARGE", str(exc))
+                return
+
+            if control == "steer":
+                fallback_pending = False
+                session_key = self._session_key_for_source(source)
+                pending_before = getattr(self, "_pending_messages", {}).get(session_key)
+                try:
+                    dispatched = await self._dispatch_native_command(
+                        frame,
+                        chat_id,
+                        f"/steer {text}",
+                        suppress_confirm=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._append_chat_event(chat_id, "message.updated", {
+                        "message_id": user_message_id,
+                        "turn_id": turn_id,
+                        "status": "failed",
+                        "error": str(exc),
+                        "updated_at": _utc_iso(),
+                    })
+                    await self._send_message_control_error(frame, ack_type, "STEER_FAILED", str(exc))
+                    return
+                if not dispatched:
+                    self._append_chat_event(chat_id, "message.updated", {
+                        "message_id": user_message_id,
+                        "turn_id": turn_id,
+                        "status": "failed",
+                        "error": "Could not route steer",
+                        "updated_at": _utc_iso(),
+                    })
+                    await self._send_message_control_error(
+                        frame,
+                        ack_type,
+                        "SESSION_SOURCE_UNAVAILABLE",
+                        "Could not route steer",
+                    )
+                    return
+                pending = getattr(self, "_pending_messages", {}).get(session_key)
+                if (
+                    pending is not None
+                    and pending is not pending_before
+                    and getattr(pending, "message_id", None) != user_message_id
+                ):
+                    pending_text = str(getattr(pending, "text", "") or "").strip()
+                    if pending_text == text:
+                        if pending_before is None:
+                            self._pending_messages.pop(session_key, None)
+                        else:
+                            self._pending_messages[session_key] = pending_before
+                        self._enqueue_message_event(event)
+                        fallback_pending = True
+                if fallback_pending:
+                    control = "queue"
+                    status = "queued"
+                    self._append_chat_event(chat_id, "message.updated", {
+                        "message_id": user_message_id,
+                        "turn_id": turn_id,
+                        "status": "queued",
+                        "intent": "queue",
+                        "updated_at": _utc_iso(),
+                    })
+                    self._append_chat_event(chat_id, "turn.queued", {
+                        "turn_id": turn_id,
+                        "message_id": user_message_id,
+                        "queued_at": _utc_iso(),
+                    })
+                    self._append_session_status(chat_id, source=event.source)
+            elif queued:
+                self._append_chat_event(chat_id, "turn.queued", {
+                    "turn_id": turn_id,
+                    "message_id": user_message_id,
+                    "queued_at": _utc_iso(),
+                })
+                self._enqueue_message_event(event)
+                self._append_session_status(chat_id, source=event.source)
+            else:
+                self._active_turns_by_chat[chat_id] = self._active_turn_for_event(event)
+                task = asyncio.create_task(self._process_chat_message(chat_id, user_message_id, turn_id, event))
+                self._chat_message_tasks.add(task)
+                task.add_done_callback(self._chat_message_tasks.discard)
+
+            accepted = {
+                "turn_id": turn_id,
+                "user_message_id": user_message_id,
+                "accepted_at": time.time(),
+                "source": event.source,
+                "intent": control,
+                "message_status": status,
+            }
+            self._accepted_chat_messages[dedup_key] = accepted
+            self._accepted_chat_messages.move_to_end(dedup_key)
+            while len(self._accepted_chat_messages) > self._accepted_chat_messages_max:
+                self._accepted_chat_messages.popitem(last=False)
+
+            await self._send_frame({
+                "type": ack_type,
+                "request_id": request_id,
+                "chat_id": chat_id,
+                "client_message_id": client_message_id,
+                "message_id": user_message_id,
+                "turn_id": turn_id,
+                "intent": control,
+                "message_status": status,
+                "accepted": True,
+            })
+            await asyncio.sleep(0)
 
         async def _handle_chat_action(self, frame: dict[str, Any]) -> None:
             request_id = _safe_id(frame.get("request_id"))
@@ -1053,6 +1295,20 @@ def make_adapter_class():
                     "chat_id": chat_id,
                     "accepted": True,
                 })
+                return
+            if action in {"message.queue", "message.steer"}:
+                client_message_id = _safe_id(frame.get("client_message_id"))
+                if not client_message_id:
+                    await self._send_chat_action_error(frame, "CHAT_ACTION_INVALID", "client_message_id is required")
+                    return
+                await self._handle_message_control_action(
+                    frame,
+                    chat_id=chat_id,
+                    request_id=request_id,
+                    client_message_id=client_message_id,
+                    control="queue" if action == "message.queue" else "steer",
+                    ack_type=FRAME_CHAT_ACTION_ACK,
+                )
                 return
             if action not in {"approval.respond", "confirm.respond"} or not action_id:
                 await self._send_chat_action_error(frame, "CHAT_ACTION_INVALID", "unsupported chat action")
@@ -1437,7 +1693,7 @@ def make_adapter_class():
                     return source
             return None
 
-        def _source_for_chat_action(self, frame: dict[str, Any], chat_id: str):
+        def _source_for_chat_action(self, frame: dict[str, Any], chat_id: str, message_id: str | None = None):
             user_id = str(frame.get("user_id") or "")
             if not user_id:
                 return None
@@ -1450,7 +1706,7 @@ def make_adapter_class():
                 chat_type="dm",
                 user_id=user_id,
                 user_name=str(frame.get("user_name") or user_id),
-                message_id=_message_id("command"),
+                message_id=message_id or _message_id("command"),
             )
 
         def _session_key_for_source(self, source: Any) -> str:
@@ -1483,6 +1739,61 @@ def make_adapter_class():
                 "queued_exact": queued_exact,
                 "updated_at": _utc_iso(),
             })
+
+        def _should_queue_new_message(self, chat_id: str, event: Any) -> bool:
+            active = self._active_turns_by_chat.get(chat_id)
+            if active is not None:
+                return True
+            try:
+                session_key = self._session_key_for_source(event.source)
+            except Exception:  # noqa: BLE001
+                return False
+            if session_key in getattr(self, "_active_sessions", {}):
+                return True
+            task = getattr(self, "_session_tasks", {}).get(session_key)
+            return bool(task is not None and not task.done())
+
+        def _enqueue_message_event(self, event: Any) -> None:
+            session_key = self._session_key_for_source(event.source)
+            runner = getattr(self, "_runner", None)
+            if runner is None:
+                try:
+                    from gateway import run as gateway_run
+
+                    runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
+                    runner = runner_ref() if callable(runner_ref) else None
+                except Exception:  # noqa: BLE001
+                    runner = None
+            enqueue_fifo = getattr(runner, "_enqueue_fifo", None) if runner is not None else None
+            if callable(enqueue_fifo):
+                enqueue_fifo(session_key, event, self)
+                return
+            queued_events = getattr(self, "_queued_events", None)
+            if queued_events is None:
+                queued_events = {}
+                self._queued_events = queued_events
+            if session_key in self._pending_messages:
+                queued_events.setdefault(session_key, []).append(event)
+            else:
+                self._pending_messages[session_key] = event
+
+        def _promote_local_queued_event(self, event: Any) -> None:
+            try:
+                session_key = self._session_key_for_source(event.source)
+            except Exception:  # noqa: BLE001
+                return
+            if not session_key or session_key in getattr(self, "_pending_messages", {}):
+                return
+            queued_events = getattr(self, "_queued_events", None)
+            if not isinstance(queued_events, dict):
+                return
+            overflow = queued_events.get(session_key)
+            if not overflow:
+                return
+            next_event = overflow.pop(0)
+            if not overflow:
+                queued_events.pop(session_key, None)
+            self._pending_messages[session_key] = next_event
 
         def _queue_depth_for_session(self, session_key: str) -> tuple[int, bool]:
             if not session_key:
@@ -1693,6 +2004,18 @@ def make_adapter_class():
                 "message": message,
             })
 
+        async def _send_message_control_error(
+            self,
+            frame: dict[str, Any],
+            ack_type: str,
+            code: str,
+            message: str,
+        ) -> None:
+            if ack_type == FRAME_CHAT_ACTION_ACK:
+                await self._send_chat_action_error(frame, code, message)
+                return
+            await self._send_chat_message_error(frame, code, message)
+
         async def _send_frame(self, frame: dict[str, Any]) -> None:
             if self._client is None:
                 logger.warning("vylen gateway: cannot send frame without socket: %s", frame.get("type"))
@@ -1714,6 +2037,22 @@ def _parse_cron_envelope(text: str) -> tuple[str, str, str]:
         return text, "", ""
     body = match.group("body").strip()
     return body, match.group("job_id").strip(), match.group("name").strip()
+
+
+def _native_chat_command(text: str) -> bool:
+    command, _args = _split_native_chat_command(text)
+    return command in {"status", "reset", "queue", "steer"}
+
+
+def _split_native_chat_command(text: str) -> tuple[str, str]:
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return "", ""
+    command, _sep, args = stripped[1:].partition(" ")
+    command = command.lower()
+    if command == "q":
+        command = "queue"
+    return command, args.strip()
 
 
 def _push_cursor_chat_id(chat_id: Any) -> str:
