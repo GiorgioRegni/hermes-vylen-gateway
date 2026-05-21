@@ -28,6 +28,22 @@ class FakePlatform:
         self.value = value
 
 
+@dataclass
+class FakeSessionEntry:
+    session_id: str
+
+
+class FakeSessionStore:
+    def __init__(self) -> None:
+        self.appended: list[tuple[str, dict[str, Any]]] = []
+
+    def get_or_create_session(self, source) -> FakeSessionEntry:
+        return FakeSessionEntry(session_id=f"session_{source.chat_id}_{source.user_id}")
+
+    def append_to_transcript(self, session_id: str, message: dict[str, Any]) -> None:
+        self.appended.append((session_id, dict(message)))
+
+
 class FakeSendResult:
     def __init__(self, success: bool, message_id: str | None = None, error: str | None = None, **kwargs) -> None:
         self.success = success
@@ -579,6 +595,36 @@ async def test_turn_cancel_accepts_acknowledged_turn_before_processing_starts(ad
     release.set()
     if adapter._chat_message_tasks:
         await asyncio.gather(*tuple(adapter._chat_message_tasks))
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_appends_assistant_marker_to_hermes_history(adapter):
+    store = FakeSessionStore()
+    adapter._session_store = store
+    source = FakeSessionSource(
+        platform=adapter.platform,
+        chat_id="chat_a",
+        user_id="user_1",
+        user_name="Giorgio",
+        message_id="msg_user_1",
+    )
+    event = FakeMessageEvent(
+        text="long answer",
+        source=source,
+        message_id="msg_user_1",
+        raw_message={"turn_id": "turn_cancelled"},
+    )
+
+    adapter._cancelled_turns.add("turn_cancelled")
+    await adapter.on_processing_complete(event, types.SimpleNamespace(value="cancelled"))
+    await adapter.on_processing_complete(event, types.SimpleNamespace(value="cancelled"))
+
+    assert len(store.appended) == 1
+    session_id, marker = store.appended[0]
+    assert session_id == "session_chat_a_user_1"
+    assert marker["role"] == "assistant"
+    assert "cancelled by the user" in marker["content"]
+    assert "Do not continue" in marker["content"]
 
 
 @pytest.mark.asyncio

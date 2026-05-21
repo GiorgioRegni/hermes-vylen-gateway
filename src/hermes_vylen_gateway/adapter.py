@@ -165,6 +165,7 @@ def make_adapter_class():
             self._active_turns_by_chat: dict[str, dict[str, Any]] = {}
             self._turns_by_task: dict[asyncio.Task, dict[str, Any]] = {}
             self._cancelled_turns: set[str] = set()
+            self._session_history_cancel_markers: set[str] = set()
             self._suppress_response_tasks: set[asyncio.Task] = set()
             self._native_confirm_sessions: dict[str, dict[str, Any]] = {}
             self._chat_message_tasks: set[asyncio.Task] = set()
@@ -517,9 +518,11 @@ def make_adapter_class():
             was_cancelled = turn_id in self._cancelled_turns
             outcome_value = str(getattr(outcome, "value", outcome) or "")
             if was_cancelled:
+                self._append_cancel_marker_to_session_history(event.source, turn_id)
                 self._cleanup_cancelled_turn(chat_id, turn_id)
                 return
             if outcome_value == "cancelled":
+                self._append_cancel_marker_to_session_history(event.source, turn_id)
                 active = self._active_turns_by_chat.get(chat_id)
                 if active and active.get("turn_id") == turn_id and active.get("cancel_requested"):
                     return
@@ -1607,6 +1610,25 @@ def make_adapter_class():
             current = self._active_turns_by_chat.get(chat_id)
             if current and current.get("turn_id") == turn_id:
                 self._active_turns_by_chat.pop(chat_id, None)
+
+        def _append_cancel_marker_to_session_history(self, source: Any, turn_id: str) -> None:
+            if not turn_id or turn_id in self._session_history_cancel_markers:
+                return
+            session_store = getattr(self, "_session_store", None)
+            if session_store is None:
+                return
+            try:
+                session_entry = session_store.get_or_create_session(source)
+                session_store.append_to_transcript(session_entry.session_id, {
+                    "role": "assistant",
+                    "content": (
+                        "[Hermes run cancelled by the user before completion. "
+                        "Do not continue that cancelled request unless the user explicitly asks to resume it.]"
+                    ),
+                })
+                self._session_history_cancel_markers.add(turn_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to append Vylen cancellation marker to Hermes session history: %s", exc)
 
         def _cleanup_cancelled_turn(self, chat_id: str, turn_id: str) -> None:
             assistant_message_ids = self._assistant_messages_by_turn.pop(turn_id, set())
