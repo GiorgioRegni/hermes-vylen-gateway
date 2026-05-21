@@ -1265,6 +1265,45 @@ def make_adapter_class():
                     "accepted": True,
                 })
                 return
+            if action == "session.controls":
+                source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
+                self._append_session_controls(chat_id, source=source)
+                await self._send_frame({
+                    "type": FRAME_CHAT_ACTION_ACK,
+                    "request_id": request_id,
+                    "chat_id": chat_id,
+                    "accepted": True,
+                })
+                return
+            if action == "session.reasoning":
+                value = str(frame.get("text") or "").strip().lower()
+                if value not in {"none", "minimal", "low", "medium", "high", "xhigh", "reset", "show", "hide", "on", "off"}:
+                    await self._send_chat_action_error(frame, "SESSION_REASONING_INVALID", "Unsupported reasoning value")
+                    return
+                command_value = "show" if value == "on" else "hide" if value == "off" else value
+                try:
+                    dispatched = await self._dispatch_native_command(
+                        frame,
+                        chat_id,
+                        f"/reasoning {command_value}",
+                        suppress_confirm=False,
+                        wait_for_completion=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    await self._send_chat_action_error(frame, "SESSION_REASONING_FAILED", str(exc))
+                    return
+                if not dispatched:
+                    await self._send_chat_action_error(frame, "SESSION_SOURCE_UNAVAILABLE", "Could not route reasoning command")
+                    return
+                source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
+                self._append_session_controls(chat_id, source=source)
+                await self._send_frame({
+                    "type": FRAME_CHAT_ACTION_ACK,
+                    "request_id": request_id,
+                    "chat_id": chat_id,
+                    "accepted": True,
+                })
+                return
             if action == "session.reset":
                 active = self._active_turns_by_chat.get(chat_id)
                 if active is not None:
@@ -1761,6 +1800,112 @@ def make_adapter_class():
                 "queued_exact": queued_exact,
                 "updated_at": _utc_iso(),
             })
+
+        def _append_session_controls(self, chat_id: str, *, source: Any | None = None) -> None:
+            source = source or self._source_for_chat(chat_id)
+            session_key = self._session_key_for_source(source) if source is not None else ""
+            model, provider = self._current_model_provider(source, session_key)
+            effort, scope, display = self._current_reasoning_controls(source, session_key)
+            self._append_chat_event(chat_id, "session.controls", {
+                "controls_id": _message_id("controls"),
+                "model": model,
+                "provider": provider,
+                "reasoning_effort": effort,
+                "reasoning_scope": scope,
+                "reasoning_display": display,
+                "updated_at": _utc_iso(),
+            })
+
+        def _gateway_runner(self) -> Any | None:
+            runner = getattr(self, "_runner", None)
+            if runner is not None:
+                return runner
+            try:
+                from gateway import run as gateway_run
+
+                runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
+                return runner_ref() if callable(runner_ref) else None
+            except Exception:  # noqa: BLE001
+                return None
+
+        def _current_model_provider(self, source: Any | None, session_key: str) -> tuple[str, str]:
+            runner = self._gateway_runner()
+            resolver = getattr(runner, "_resolve_session_agent_runtime", None) if runner is not None else None
+            if callable(resolver):
+                try:
+                    model, runtime = resolver(source=source, session_key=session_key)
+                    provider = runtime.get("provider") if isinstance(runtime, dict) else ""
+                    return str(model or "").strip(), str(provider or "").strip()
+                except Exception:  # noqa: BLE001
+                    logger.debug("vylen gateway: failed to resolve runtime model config", exc_info=True)
+
+            model = ""
+            provider = ""
+            try:
+                from gateway.run import _load_gateway_config
+
+                cfg = _load_gateway_config() or {}
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, dict):
+                    model = str(model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("name") or "").strip()
+                    provider = str(model_cfg.get("provider") or "").strip()
+                elif model_cfg:
+                    model = str(model_cfg).strip()
+            except Exception:  # noqa: BLE001
+                logger.debug("vylen gateway: failed to read model config", exc_info=True)
+
+            override_owner = runner if runner is not None else self
+            override = (getattr(override_owner, "_session_model_overrides", {}) or {}).get(session_key, {}) if session_key else {}
+            if isinstance(override, dict):
+                model = str(override.get("model") or model).strip()
+                provider = str(override.get("provider") or provider).strip()
+            return model, provider
+
+        def _current_reasoning_controls(self, source: Any | None, session_key: str) -> tuple[str, str, bool]:
+            runner = self._gateway_runner()
+            resolver_owner = runner if runner is not None else self
+            try:
+                resolver = getattr(resolver_owner, "_resolve_session_reasoning_config")
+                config = resolver(source=source, session_key=session_key)
+            except Exception:  # noqa: BLE001
+                logger.debug("vylen gateway: failed to resolve reasoning config", exc_info=True)
+                config = None
+
+            if isinstance(config, dict) and config.get("enabled") is False:
+                effort = "none"
+            elif isinstance(config, dict) and str(config.get("effort") or "").strip().lower() in {"minimal", "low", "medium", "high", "xhigh"}:
+                effort = str(config.get("effort") or "").strip().lower()
+            else:
+                effort = "medium"
+
+            overrides = getattr(resolver_owner, "_session_reasoning_overrides", {}) or {}
+            scope = "session" if session_key and session_key in overrides else "global"
+            display = self._current_reasoning_display(source)
+            return effort, scope, display
+
+        def _current_reasoning_display(self, source: Any | None) -> bool:
+            try:
+                from gateway.run import _load_gateway_config, _platform_config_key
+
+                cfg = _load_gateway_config() or {}
+                display_cfg = cfg.get("display") if isinstance(cfg, dict) else {}
+                if isinstance(display_cfg, dict):
+                    platform = getattr(source, "platform", "") if source is not None else ""
+                    platform_key = _platform_config_key(platform) if platform else ""
+                    platforms_cfg = display_cfg.get("platforms")
+                    if platform_key and isinstance(platforms_cfg, dict):
+                        platform_cfg = platforms_cfg.get(platform_key)
+                        if isinstance(platform_cfg, dict) and "show_reasoning" in platform_cfg:
+                            return bool(platform_cfg.get("show_reasoning"))
+                    if "show_reasoning" in display_cfg:
+                        return bool(display_cfg.get("show_reasoning"))
+            except Exception:  # noqa: BLE001
+                logger.debug("vylen gateway: failed to read reasoning display config", exc_info=True)
+
+            try:
+                return bool(self._load_show_reasoning())
+            except Exception:  # noqa: BLE001
+                return False
 
         def _should_queue_new_message(self, chat_id: str, event: Any) -> bool:
             active = self._active_turns_by_chat.get(chat_id)

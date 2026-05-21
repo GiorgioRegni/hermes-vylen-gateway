@@ -718,6 +718,79 @@ async def test_session_status_action_returns_error_when_dispatch_fails(adapter):
 
 
 @pytest.mark.asyncio
+async def test_session_controls_action_emits_model_and_reasoning_state(adapter):
+    session_key = "vylen:chat_a:user_2"
+    runner = types.SimpleNamespace(
+        _session_reasoning_overrides={session_key: {"enabled": True, "effort": "high"}},
+    )
+    runner._resolve_session_agent_runtime = (
+        lambda **kwargs: ("gpt-5.5", {"provider": "openai-codex"})
+    )
+    runner._resolve_session_reasoning_config = lambda **kwargs: {"enabled": True, "effort": "high"}
+    adapter._runner = runner
+    adapter._load_show_reasoning = lambda: True
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "controls_req",
+        "chat_id": "chat_a",
+        "action": "session.controls",
+        "user_id": "user_2",
+        "user_name": "Ada",
+    })
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    controls_events = [event for event in events if event.kind == "session.controls"]
+    assert controls_events
+    assert controls_events[-1].payload["model"] == "gpt-5.5"
+    assert controls_events[-1].payload["provider"] == "openai-codex"
+    assert controls_events[-1].payload["reasoning_effort"] == "high"
+    assert controls_events[-1].payload["reasoning_scope"] == "session"
+    assert controls_events[-1].payload["reasoning_display"] is True
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "controls_req"
+
+
+@pytest.mark.asyncio
+async def test_session_reasoning_action_dispatches_hermes_reasoning_command(adapter):
+    dispatched: list[str] = []
+    runner = types.SimpleNamespace(_session_reasoning_overrides={})
+    runner._resolve_session_agent_runtime = (
+        lambda **kwargs: ("gpt-5.5", {"provider": "openai-codex"})
+    )
+    runner._resolve_session_reasoning_config = lambda **kwargs: (
+        {"enabled": True, "effort": "xhigh"}
+        if "vylen:chat_a:user_1" in runner._session_reasoning_overrides
+        else {"enabled": True, "effort": "medium"}
+    )
+    adapter._runner = runner
+
+    async def dispatch(frame, chat_id, text, **kwargs):
+        dispatched.append(text)
+        runner._session_reasoning_overrides["vylen:chat_a:user_1"] = {"enabled": True, "effort": "xhigh"}
+        return True
+
+    adapter._dispatch_native_command = dispatch
+    adapter._load_show_reasoning = lambda: False
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "reasoning_req",
+        "chat_id": "chat_a",
+        "action": "session.reasoning",
+        "text": "xhigh",
+        "user_id": "user_1",
+    })
+
+    assert dispatched == ["/reasoning xhigh"]
+    events = adapter._chat_event_logs.get("chat_a").events
+    controls_events = [event for event in events if event.kind == "session.controls"]
+    assert controls_events[-1].payload["reasoning_effort"] == "xhigh"
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "reasoning_req"
+
+
+@pytest.mark.asyncio
 async def test_session_reset_action_retains_divider_and_dispatches_slash_reset(adapter):
     handled: list[str] = []
 
