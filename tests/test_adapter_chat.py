@@ -226,6 +226,28 @@ async def test_chat_message_deduplicates_by_chat_and_client_message_id(adapter):
 
 
 @pytest.mark.asyncio
+async def test_chat_message_ack_is_sent_before_long_running_handler_finishes(adapter):
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(event):
+        ready.set()
+        await release.wait()
+        return "done"
+
+    adapter.set_message_handler(handler)
+    task = asyncio.create_task(adapter._handle_chat_message(_chat_message_frame()))
+    await ready.wait()
+
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_ack"]
+    assert len(acks) == 1
+    assert acks[0]["client_message_id"] == "client_msg_1"
+
+    release.set()
+    await task
+
+
+@pytest.mark.asyncio
 async def test_retained_chat_events_replay_when_no_client_was_live(adapter):
     async def handler(event):
         return "pong"
@@ -572,9 +594,45 @@ async def test_turn_cancel_dispatch_failure_returns_error_and_keeps_turn_active(
     assert errors[-1]["code"] == "TURN_CANCEL_FAILED"
     assert adapter._active_turns_by_chat["chat_a"]["turn_id"] == turn_id
     assert turn_id not in adapter._cancelled_turns
+    assert "cancel_requested" not in adapter._active_turns_by_chat["chat_a"]
     log = adapter._chat_event_logs.get("chat_a")
-    events = log.events if log else []
+    events = log.events if log is not None else []
     assert not any(event.kind == "turn.cancelled" and event.payload["turn_id"] == turn_id for event in events)
+
+
+@pytest.mark.asyncio
+async def test_turn_cancel_does_not_duplicate_cancel_event_when_completion_runs_during_stop(adapter, monkeypatch):
+    turn_id = "turn_cancel_race"
+    event = FakeMessageEvent(
+        text="original",
+        source=FakeSessionSource(platform=adapter.platform, chat_id="chat_a", user_id="user_1"),
+        message_id="msg_user",
+        raw_message={"turn_id": turn_id},
+    )
+    adapter._active_turns_by_chat["chat_a"] = {
+        "turn_id": turn_id,
+        "message_id": "msg_user",
+        "session_key": "vylen:chat_a:user_1",
+        "source": event.source,
+    }
+
+    async def dispatch_and_complete(chat_id, active):
+        await adapter.on_processing_complete(event, types.SimpleNamespace(value="cancelled"))
+
+    monkeypatch.setattr(adapter, "_dispatch_native_stop", dispatch_and_complete)
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "cancel_req_race",
+        "chat_id": "chat_a",
+        "turn_id": turn_id,
+        "action": "turn.cancel",
+    })
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    cancelled = [event for event in events if event.kind == "turn.cancelled"]
+    assert len(cancelled) == 1
+    assert cancelled[0].payload["reason"] == "user_stop"
 
 
 @pytest.mark.asyncio

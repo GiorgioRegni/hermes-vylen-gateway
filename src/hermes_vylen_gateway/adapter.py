@@ -526,6 +526,9 @@ def make_adapter_class():
                     self._active_turns_by_chat.pop(chat_id, None)
                 return
             if outcome_value == "cancelled":
+                active = self._active_turns_by_chat.get(chat_id)
+                if active and active.get("turn_id") == turn_id and active.get("cancel_requested"):
+                    return
                 kind = "turn.cancelled"
                 payload = {
                     "turn_id": turn_id,
@@ -837,6 +840,15 @@ def make_adapter_class():
                 await self._send_chat_message_error(frame, "CHAT_EVENT_TOO_LARGE", str(exc))
                 return
 
+            await self._send_frame({
+                "type": FRAME_CHAT_MESSAGE_ACK,
+                "request_id": request_id,
+                "chat_id": chat_id,
+                "client_message_id": client_message_id,
+                "turn_id": turn_id,
+                "accepted": True,
+            })
+
             try:
                 event = self._build_message_event(
                     frame=frame,
@@ -849,24 +861,20 @@ def make_adapter_class():
                 )
                 await self.handle_message(event)
             except Exception as exc:  # noqa: BLE001
-                self._accepted_chat_messages.pop(dedup_key, None)
                 self._append_chat_event(chat_id, "turn.failed", {
                     "turn_id": turn_id,
                     "message_id": user_message_id,
                     "error": str(exc),
                     "failed_at": _utc_iso(),
                 })
-                await self._send_chat_message_error(frame, "MESSAGE_HANDLER_FAILED", str(exc))
+                self._append_chat_event(chat_id, "message.updated", {
+                    "message_id": user_message_id,
+                    "turn_id": turn_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "updated_at": _utc_iso(),
+                })
                 return
-
-            await self._send_frame({
-                "type": FRAME_CHAT_MESSAGE_ACK,
-                "request_id": request_id,
-                "chat_id": chat_id,
-                "client_message_id": client_message_id,
-                "turn_id": turn_id,
-                "accepted": True,
-            })
 
         async def _handle_chat_action(self, frame: dict[str, Any]) -> None:
             request_id = _safe_id(frame.get("request_id"))
@@ -882,9 +890,11 @@ def make_adapter_class():
                 if not turn_id or active is None or active.get("turn_id") != turn_id:
                     await self._send_chat_action_error(frame, "TURN_NOT_ACTIVE", "This turn is no longer active")
                     return
+                active["cancel_requested"] = True
                 try:
                     await self._dispatch_native_stop(chat_id, active)
                 except Exception as exc:  # noqa: BLE001
+                    active.pop("cancel_requested", None)
                     await self._send_chat_action_error(frame, "TURN_CANCEL_FAILED", str(exc))
                     return
                 self._cancel_active_turn(chat_id, active, reason="user_stop")
