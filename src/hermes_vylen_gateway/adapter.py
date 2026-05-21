@@ -1016,14 +1016,18 @@ def make_adapter_class():
                 if active is not None:
                     await self._send_chat_action_error(frame, "TURN_ACTIVE", "Stop the current run first")
                     return
-                dispatched = await self._dispatch_native_command(
-                    frame,
-                    chat_id,
-                    "/reset",
-                    suppress_confirm=True,
-                    expected_confirm_commands={"new"},
-                    wait_for_completion=True,
-                )
+                try:
+                    dispatched = await self._dispatch_native_command(
+                        frame,
+                        chat_id,
+                        "/reset",
+                        suppress_confirm=True,
+                        expected_confirm_commands={"new"},
+                        wait_for_completion=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    await self._send_chat_action_error(frame, "SESSION_RESET_FAILED", str(exc))
+                    return
                 if not dispatched:
                     await self._send_chat_action_error(frame, "SESSION_SOURCE_UNAVAILABLE", "Could not route session reset")
                     return

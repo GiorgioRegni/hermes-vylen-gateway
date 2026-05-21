@@ -420,6 +420,26 @@ async def test_session_reset_action_uses_requesting_user_source(adapter):
 
 
 @pytest.mark.asyncio
+async def test_session_reset_action_returns_error_when_dispatch_fails(adapter):
+    async def fail_dispatch(*args, **kwargs):
+        raise RuntimeError("reset timed out")
+
+    adapter._dispatch_native_command = fail_dispatch
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "reset_req_failure",
+        "chat_id": "chat_a",
+        "action": "session.reset",
+    })
+
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["request_id"] == "reset_req_failure"
+    assert errors[-1]["code"] == "SESSION_RESET_FAILED"
+    assert adapter._chat_event_logs.get("chat_a") is None
+
+
+@pytest.mark.asyncio
 async def test_session_reset_action_builds_source_without_prior_message(adapter):
     handled: list[Any] = []
 
