@@ -166,6 +166,7 @@ def make_adapter_class():
             self._turns_by_task: dict[asyncio.Task, dict[str, Any]] = {}
             self._cancelled_turns: set[str] = set()
             self._suppress_response_tasks: set[asyncio.Task] = set()
+            self._chat_message_tasks: set[asyncio.Task] = set()
             self._assistant_turn_by_message: dict[str, str] = {}
             self._assistant_messages_by_turn: dict[str, set[str]] = {}
             self._activity_groups_by_message: dict[str, list[dict[str, str]]] = {}
@@ -319,6 +320,11 @@ def make_adapter_class():
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
                 self._chat_sweep_task = None
+            for task in tuple(self._chat_message_tasks):
+                task.cancel()
+            if self._chat_message_tasks:
+                await asyncio.gather(*self._chat_message_tasks, return_exceptions=True)
+                self._chat_message_tasks.clear()
             if self._memory:
                 await self._memory.close()
                 self._memory = None
@@ -472,20 +478,13 @@ def make_adapter_class():
                 return
             chat_id = str(event.source.chat_id)
             user_message_id = str(getattr(event, "message_id", "") or "")
-            from gateway.session import build_session_key
-
-            session_key = build_session_key(
-                event.source,
-                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            )
-            active = {
-                "turn_id": turn_id,
-                "message_id": user_message_id,
-                "session_key": session_key,
-                "source": event.source,
-            }
-            self._active_turns_by_chat[chat_id] = active
+            active = self._active_turns_by_chat.get(chat_id)
+            if active is None or active.get("turn_id") != turn_id:
+                active = self._active_turn_for_event(event)
+                self._active_turns_by_chat[chat_id] = active
+            else:
+                active["message_id"] = user_message_id
+                active["source"] = event.source
             task = asyncio.current_task()
             if task is not None:
                 self._turns_by_task[task] = {"chat_id": chat_id, **active}
@@ -514,16 +513,7 @@ def make_adapter_class():
             was_cancelled = turn_id in self._cancelled_turns
             outcome_value = str(getattr(outcome, "value", outcome) or "")
             if was_cancelled:
-                assistant_message_ids = self._assistant_messages_by_turn.pop(turn_id, set())
-                for assistant_message_id in assistant_message_ids:
-                    self._assistant_turn_by_message.pop(assistant_message_id, None)
-                for activity_id in self._activity_ids_by_turn.pop(turn_id, set()):
-                    self._activity_payloads_by_id.pop(activity_id, None)
-                    self._activity_status_by_id.pop(activity_id, None)
-                self._cancelled_turns.discard(turn_id)
-                active = self._active_turns_by_chat.get(chat_id)
-                if active and active.get("turn_id") == turn_id:
-                    self._active_turns_by_chat.pop(chat_id, None)
+                self._cleanup_cancelled_turn(chat_id, turn_id)
                 return
             if outcome_value == "cancelled":
                 active = self._active_turns_by_chat.get(chat_id)
@@ -840,6 +830,17 @@ def make_adapter_class():
                 await self._send_chat_message_error(frame, "CHAT_EVENT_TOO_LARGE", str(exc))
                 return
 
+            event = self._build_message_event(
+                frame=frame,
+                chat_id=chat_id,
+                text=text,
+                user_message_id=user_message_id,
+                turn_id=turn_id,
+                media_urls=attachment_result["paths"],
+                media_types=attachment_result["types"],
+            )
+            self._active_turns_by_chat[chat_id] = self._active_turn_for_event(event)
+
             await self._send_frame({
                 "type": FRAME_CHAT_MESSAGE_ACK,
                 "request_id": request_id,
@@ -849,16 +850,16 @@ def make_adapter_class():
                 "accepted": True,
             })
 
+            task = asyncio.create_task(self._process_chat_message(chat_id, user_message_id, turn_id, event))
+            self._chat_message_tasks.add(task)
+            task.add_done_callback(self._chat_message_tasks.discard)
+            await asyncio.sleep(0)
+
+        async def _process_chat_message(self, chat_id: str, user_message_id: str, turn_id: str, event: Any) -> None:
+            if turn_id in self._cancelled_turns:
+                self._cleanup_cancelled_turn(chat_id, turn_id)
+                return
             try:
-                event = self._build_message_event(
-                    frame=frame,
-                    chat_id=chat_id,
-                    text=text,
-                    user_message_id=user_message_id,
-                    turn_id=turn_id,
-                    media_urls=attachment_result["paths"],
-                    media_types=attachment_result["types"],
-                )
                 await self.handle_message(event)
             except Exception as exc:  # noqa: BLE001
                 self._append_chat_event(chat_id, "turn.failed", {
@@ -874,7 +875,6 @@ def make_adapter_class():
                     "error": str(exc),
                     "updated_at": _utc_iso(),
                 })
-                return
 
         async def _handle_chat_action(self, frame: dict[str, Any]) -> None:
             request_id = _safe_id(frame.get("request_id"))
@@ -1073,7 +1073,7 @@ def make_adapter_class():
                 if not isinstance(data_url, str) or not data_url:
                     raise ValueError("attachment data_url is required")
                 mime_type, data = _decode_data_url(data_url)
-                declared_mime = str(attachment.get("mime_type") or mime_type)
+                declared_mime = str(attachment.get("mime_type") or mime_type).strip().lower()
                 if declared_mime and declared_mime != mime_type:
                     raise ValueError("attachment mime_type does not match data_url")
                 total += len(data)
@@ -1176,6 +1176,18 @@ def make_adapter_class():
             if current and current.get("turn_id") == turn_id:
                 self._active_turns_by_chat.pop(chat_id, None)
 
+        def _cleanup_cancelled_turn(self, chat_id: str, turn_id: str) -> None:
+            assistant_message_ids = self._assistant_messages_by_turn.pop(turn_id, set())
+            for assistant_message_id in assistant_message_ids:
+                self._assistant_turn_by_message.pop(assistant_message_id, None)
+            for activity_id in self._activity_ids_by_turn.pop(turn_id, set()):
+                self._activity_payloads_by_id.pop(activity_id, None)
+                self._activity_status_by_id.pop(activity_id, None)
+            self._cancelled_turns.discard(turn_id)
+            active = self._active_turns_by_chat.get(chat_id)
+            if active and active.get("turn_id") == turn_id:
+                self._active_turns_by_chat.pop(chat_id, None)
+
         async def _dispatch_native_stop(self, chat_id: str, active: dict[str, Any]) -> None:
             source = active.get("source")
             if source is None:
@@ -1192,6 +1204,20 @@ def make_adapter_class():
             finally:
                 if task is not None:
                     self._suppress_response_tasks.discard(task)
+
+        def _active_turn_for_event(self, event) -> dict[str, Any]:
+            from gateway.session import build_session_key
+
+            return {
+                "turn_id": _event_turn_id(event),
+                "message_id": str(getattr(event, "message_id", "") or ""),
+                "session_key": build_session_key(
+                    event.source,
+                    group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                    thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+                ),
+                "source": event.source,
+            }
 
         def _emit_tool_progress(
             self,

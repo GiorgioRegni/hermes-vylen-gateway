@@ -238,13 +238,47 @@ async def test_chat_message_ack_is_sent_before_long_running_handler_finishes(ada
     adapter.set_message_handler(handler)
     task = asyncio.create_task(adapter._handle_chat_message(_chat_message_frame()))
     await ready.wait()
+    await asyncio.wait_for(task, timeout=1)
 
     acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_ack"]
     assert len(acks) == 1
     assert acks[0]["client_message_id"] == "client_msg_1"
 
     release.set()
-    await task
+    if adapter._chat_message_tasks:
+        await asyncio.gather(*tuple(adapter._chat_message_tasks))
+
+
+@pytest.mark.asyncio
+async def test_turn_cancel_accepts_acknowledged_turn_before_processing_starts(adapter, monkeypatch):
+    release = asyncio.Event()
+
+    async def hold_processing(chat_id, user_message_id, turn_id, event):
+        await release.wait()
+
+    monkeypatch.setattr(adapter, "_process_chat_message", hold_processing)
+
+    await adapter._handle_chat_message(_chat_message_frame())
+    ack = next(frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_ack")
+    events = adapter._chat_event_logs.get("chat_a").events
+    assert not any(event.kind == "turn.started" for event in events)
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "cancel_req_early",
+        "chat_id": "chat_a",
+        "turn_id": ack["turn_id"],
+        "action": "turn.cancel",
+    })
+
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors == []
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["turn_id"] == ack["turn_id"]
+
+    release.set()
+    if adapter._chat_message_tasks:
+        await asyncio.gather(*tuple(adapter._chat_message_tasks))
 
 
 @pytest.mark.asyncio
@@ -453,7 +487,7 @@ async def test_chat_message_decodes_inline_image_data_url(adapter, monkeypatch, 
     await adapter._handle_chat_message(_chat_message_frame(attachments=[{
         "id": "att_1",
         "type": "image",
-        "mime_type": "image/png",
+        "mime_type": "Image/PNG",
         "filename": "whiteboard.png",
         "data_url": f"data:image/png;base64,{png}",
     }]))
@@ -667,6 +701,8 @@ async def test_turn_cancel_fences_late_output_from_cancelled_task(adapter):
     })
     release.set()
     await task
+    if adapter._chat_message_tasks:
+        await asyncio.gather(*tuple(adapter._chat_message_tasks))
 
     assert late_result is not None
     assert late_result.success is False
@@ -719,6 +755,8 @@ async def test_new_turn_after_cancel_gets_clean_output(adapter):
     ))
     first_release.set()
     await first_task
+    if adapter._chat_message_tasks:
+        await asyncio.gather(*tuple(adapter._chat_message_tasks))
 
     events = adapter._chat_event_logs.get("chat_a").events
     assistant_texts = [
