@@ -917,7 +917,7 @@ def make_adapter_class():
             request_id: str,
         ) -> None:
             turn_id = _message_id("command_turn")
-            source = self._source_for_chat(chat_id) or self._source_for_chat_action(frame, chat_id)
+            source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
             accepted = {
                 "turn_id": turn_id,
                 "user_message_id": _message_id("command"),
@@ -931,7 +931,7 @@ def make_adapter_class():
                 self._accepted_chat_messages.popitem(last=False)
 
             if text == "/status":
-                self._append_session_status(chat_id)
+                self._append_session_status(chat_id, source=source)
                 await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
             else:
                 active = self._active_turns_by_chat.get(chat_id)
@@ -1001,7 +1001,8 @@ def make_adapter_class():
                 })
                 return
             if action == "session.status":
-                self._append_session_status(chat_id)
+                source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
+                self._append_session_status(chat_id, source=source)
                 await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
@@ -1031,7 +1032,8 @@ def make_adapter_class():
                     "text": "Cleared history",
                     "cleared_at": _utc_iso(),
                 })
-                self._append_session_status(chat_id)
+                source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
+                self._append_session_status(chat_id, source=source)
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
                     "request_id": request_id,
@@ -1099,7 +1101,8 @@ def make_adapter_class():
                             "text": "Cleared history",
                             "cleared_at": _utc_iso(),
                         })
-                        self._append_session_status(chat_id)
+                        source = record.get("source")
+                        self._append_session_status(chat_id, source=source)
                 else:
                     from tools import slash_confirm as _slash_confirm_mod
 
@@ -1375,7 +1378,7 @@ def make_adapter_class():
             expected_confirm_commands: set[str] | None = None,
             wait_for_completion: bool = False,
         ) -> bool:
-            source = self._source_for_chat(chat_id) or self._source_for_chat_action(frame, chat_id)
+            source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
             if source is None:
                 return False
             session_key = self._session_key_for_source(source)
@@ -1446,9 +1449,9 @@ def make_adapter_class():
                 thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             )
 
-        def _append_session_status(self, chat_id: str) -> None:
+        def _append_session_status(self, chat_id: str, *, source: Any | None = None) -> None:
             active = self._active_turns_by_chat.get(chat_id)
-            source = self._source_for_chat(chat_id)
+            source = source or self._source_for_chat(chat_id)
             session_key = self._session_key_for_source(source) if source is not None else ""
             active_turn_id = str((active or {}).get("turn_id") or "")
             running_activities = [

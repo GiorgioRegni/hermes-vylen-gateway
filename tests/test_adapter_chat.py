@@ -317,6 +317,42 @@ async def test_session_status_action_emits_retained_status_without_ack_bubble(ad
 
 
 @pytest.mark.asyncio
+async def test_session_status_action_uses_requesting_user_source(adapter):
+    async def initial_handler(event):
+        return "pong"
+
+    adapter.set_message_handler(initial_handler)
+    await adapter._handle_chat_message(_chat_message_frame(user_id="user_1"))
+
+    handled: list[Any] = []
+
+    async def handler(event):
+        handled.append(event)
+        return "status text that should be suppressed"
+
+    adapter.set_message_handler(handler)
+    adapter._fake_client.sent.clear()
+    adapter._pending_messages["vylen:chat_a:user_1"] = object()
+    adapter._pending_messages["vylen:chat_a:user_2"] = object()
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "status_req_user_2",
+        "chat_id": "chat_a",
+        "action": "session.status",
+        "user_id": "user_2",
+        "user_name": "Ada",
+    })
+
+    assert handled[-1].source.user_id == "user_2"
+    status_events = [
+        event for event in adapter._chat_event_logs.get("chat_a").events
+        if event.kind == "session.status"
+    ]
+    assert status_events[-1].payload["queued"] == 1
+
+
+@pytest.mark.asyncio
 async def test_session_reset_action_retains_divider_and_dispatches_slash_reset(adapter):
     handled: list[str] = []
 
@@ -349,6 +385,38 @@ async def test_session_reset_action_retains_divider_and_dispatches_slash_reset(a
     )
     action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
     assert action_acks[-1]["request_id"] == "reset_req"
+
+
+@pytest.mark.asyncio
+async def test_session_reset_action_uses_requesting_user_source(adapter):
+    handled: list[Any] = []
+
+    async def initial_handler(event):
+        return "pong"
+
+    adapter.set_message_handler(initial_handler)
+    await adapter._handle_chat_message(_chat_message_frame(user_id="user_1"))
+
+    async def handler(event):
+        handled.append(event)
+        return None
+
+    adapter.set_message_handler(handler)
+    adapter._fake_client.sent.clear()
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "reset_req_user_2",
+        "chat_id": "chat_a",
+        "action": "session.reset",
+        "user_id": "user_2",
+        "user_name": "Ada",
+    })
+
+    assert handled[-1].text == "/reset"
+    assert handled[-1].source.user_id == "user_2"
+    action_acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert action_acks[-1]["request_id"] == "reset_req_user_2"
 
 
 @pytest.mark.asyncio
