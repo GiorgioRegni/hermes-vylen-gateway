@@ -885,7 +885,6 @@ def make_adapter_class():
                 try:
                     await self._dispatch_native_stop(chat_id, active)
                 except Exception as exc:  # noqa: BLE001
-                    self._cancel_active_turn(chat_id, active, reason="user_stop")
                     await self._send_chat_action_error(frame, "TURN_CANCEL_FAILED", str(exc))
                     return
                 self._cancel_active_turn(chat_id, active, reason="user_stop")

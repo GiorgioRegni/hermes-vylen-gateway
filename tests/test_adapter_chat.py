@@ -546,7 +546,7 @@ async def test_turn_cancel_action_cancels_active_session(adapter):
 
 
 @pytest.mark.asyncio
-async def test_turn_cancel_dispatch_failure_returns_error_and_closes_turn(adapter, monkeypatch):
+async def test_turn_cancel_dispatch_failure_returns_error_and_keeps_turn_active(adapter, monkeypatch):
     turn_id = "turn_cancel_fail"
     adapter._active_turns_by_chat["chat_a"] = {
         "turn_id": turn_id,
@@ -570,9 +570,10 @@ async def test_turn_cancel_dispatch_failure_returns_error_and_closes_turn(adapte
 
     errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
     assert errors[-1]["code"] == "TURN_CANCEL_FAILED"
-    assert "chat_a" not in adapter._active_turns_by_chat
+    assert adapter._active_turns_by_chat["chat_a"]["turn_id"] == turn_id
+    assert turn_id not in adapter._cancelled_turns
     events = adapter._chat_event_logs.get("chat_a").events
-    assert any(event.kind == "turn.cancelled" and event.payload["turn_id"] == turn_id for event in events)
+    assert not any(event.kind == "turn.cancelled" and event.payload["turn_id"] == turn_id for event in events)
 
 
 @pytest.mark.asyncio
