@@ -220,6 +220,28 @@ async def test_chat_message_deduplicates_by_chat_and_client_message_id(adapter):
 
 
 @pytest.mark.asyncio
+async def test_status_and_reset_with_args_are_regular_messages(adapter):
+    handled: list[str] = []
+
+    async def handler(event):
+        handled.append(event.text)
+        return "pong"
+
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_chat_message(_chat_message_frame(text="/status report"))
+    await adapter._handle_chat_message(_chat_message_frame(
+        request_id="req_2",
+        client_message_id="client_msg_2",
+        text="/reset please summarize",
+    ))
+
+    assert handled == ["/status report", "/reset please summarize"]
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_error"]
+    assert errors == []
+
+
+@pytest.mark.asyncio
 async def test_chat_message_during_active_run_queues_instead_of_interrupting(adapter):
     handled: list[FakeMessageEvent] = []
 

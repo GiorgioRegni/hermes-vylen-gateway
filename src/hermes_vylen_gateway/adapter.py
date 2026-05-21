@@ -2040,8 +2040,10 @@ def _parse_cron_envelope(text: str) -> tuple[str, str, str]:
 
 
 def _native_chat_command(text: str) -> bool:
-    command, _args = _split_native_chat_command(text)
-    return command in {"status", "reset", "queue", "steer"}
+    command, args = _split_native_chat_command(text)
+    if command in {"status", "reset"}:
+        return not args
+    return command in {"queue", "steer"}
 
 
 def _split_native_chat_command(text: str) -> tuple[str, str]:
