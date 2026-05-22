@@ -31,6 +31,7 @@ from .chat_cursor import (
 )
 from .chat_store import ChatStateStore, ChatStateUnavailable, InvalidChatStateEvent
 from .client import HandshakeError, VylenGatewayClient
+from .commands import FRAME_COMMANDS_REQUEST, CommandsRPC
 from .config import ConfigError, load_from_env
 from .event_log import EventTooLarge
 from .health import HealthReporter
@@ -178,6 +179,7 @@ def make_adapter_class():
             self._health: HealthReporter | None = None
             self._transcribe: Transcriber | None = None
             self._memory: MemoryRPC | None = None
+            self._commands: CommandsRPC | None = None
             self._chat_cursors: ChatCursorRelay | None = None
             self._chat_event_logs = ChatStateStore.from_env()
             self._accepted_chat_messages: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
@@ -251,6 +253,7 @@ def make_adapter_class():
                 relay = self._relay
                 transcriber = self._transcribe
                 memory = self._memory
+                commands_rpc = self._commands
 
                 async def on_frame(frame):
                     t = frame.get("type")
@@ -274,6 +277,8 @@ def make_adapter_class():
                         await transcriber.handle(frame)
                     elif t == FRAME_MEMORY_REQUEST and memory is not None:
                         await memory.handle(frame)
+                    elif t == FRAME_COMMANDS_REQUEST and commands_rpc is not None:
+                        await commands_rpc.handle(frame)
 
                 try:
                     await self._client.iter_frames(on_frame)
@@ -329,6 +334,7 @@ def make_adapter_class():
             self._health.start()
             self._transcribe = Transcriber(client.send)
             self._memory = MemoryRPC(client.send)
+            self._commands = CommandsRPC(client.send)
             logger.info(
                 "Vylen gateway online: instance_id=%s user_id=%s hermes=in-process",
                 ready.instance_id, ready.user_id,
@@ -365,6 +371,9 @@ def make_adapter_class():
             if self._memory:
                 await self._memory.close()
                 self._memory = None
+            if self._commands:
+                await self._commands.close()
+                self._commands = None
             if self._transcribe:
                 await self._transcribe.close()
                 self._transcribe = None
