@@ -23,13 +23,16 @@ from typing import Any, Optional
 
 from .blobs import BlobRegistry
 from .chat_cursor import (
+    FRAME_CHAT_LIST,
+    FRAME_CHAT_SNAPSHOT,
     FRAME_CHAT_SUBSCRIBE,
     FRAME_CHAT_UNSUBSCRIBE,
     ChatCursorRelay,
 )
+from .chat_store import ChatStateStore, ChatStateUnavailable, InvalidChatStateEvent
 from .client import HandshakeError, VylenGatewayClient
 from .config import ConfigError, load_from_env
-from .event_log import EventLogRegistry
+from .event_log import EventTooLarge
 from .health import HealthReporter
 from .memory import FRAME_MEMORY_REQUEST, MemoryRPC
 from .relay import FRAME_REQUEST, FRAME_RESPONSE_RESUME, HermesRelay
@@ -77,11 +80,28 @@ async def _sweep_loop(
         except asyncio.CancelledError:
             raise
         try:
-            evicted = registry.sweep()
+            if hasattr(registry, "db_live_bytes"):
+                evicted = await asyncio.to_thread(registry.sweep)
+            else:
+                evicted = registry.sweep()
             if evicted:
                 logger.debug("%s sweep: evicted=%d", label, evicted)
         except Exception:  # noqa: BLE001
             logger.exception("%s sweep failed", label)
+
+
+async def _run_single_sweep(registry: Any, *, label: str = "registry") -> None:
+    try:
+        if hasattr(registry, "db_live_bytes"):
+            evicted = await asyncio.to_thread(registry.sweep)
+        else:
+            evicted = registry.sweep()
+        if evicted:
+            logger.debug("%s sweep: evicted=%d", label, evicted)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("%s sweep failed", label)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -154,12 +174,7 @@ def make_adapter_class():
             self._transcribe: Transcriber | None = None
             self._memory: MemoryRPC | None = None
             self._chat_cursors: ChatCursorRelay | None = None
-            self._chat_event_logs = EventLogRegistry(
-                ttl_seconds=_env_float("VYLEN_CHAT_CURSOR_TTL_SECONDS", 900.0),
-                max_events=_env_int("VYLEN_CHAT_CURSOR_MAX_EVENTS", 1000),
-                max_bytes=_env_int("VYLEN_CHAT_CURSOR_MAX_BYTES", 4 * 1024 * 1024),
-                max_logs=_env_int("VYLEN_CHAT_CURSOR_MAX_CHATS", 1000),
-            )
+            self._chat_event_logs = ChatStateStore.from_env()
             self._accepted_chat_messages: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
             self._accepted_chat_messages_max = _env_int("VYLEN_CHAT_MESSAGE_DEDUP_MAX", 5000)
             self._active_turns_by_chat: dict[str, dict[str, Any]] = {}
@@ -188,6 +203,7 @@ def make_adapter_class():
             self._response_buffers: ResponseBufferRegistry | None = None
             self._response_sweep_task: asyncio.Task | None = None
             self._chat_sweep_task: asyncio.Task | None = None
+            self._chat_sweep_request_task: asyncio.Task | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
@@ -214,6 +230,7 @@ def make_adapter_class():
                     pass
                 self._task = None
             await self._teardown_session()
+            self._chat_event_logs.close()
 
         async def _supervisor(self) -> None:
             backoff = 1.0
@@ -240,6 +257,10 @@ def make_adapter_class():
                         await self._chat_cursors.handle_subscribe(frame)
                     elif t == FRAME_CHAT_UNSUBSCRIBE and self._chat_cursors is not None:
                         self._chat_cursors.cancel(str(frame.get("request_id") or ""))
+                    elif t == FRAME_CHAT_LIST and self._chat_cursors is not None:
+                        await self._chat_cursors.handle_list(frame)
+                    elif t == FRAME_CHAT_SNAPSHOT and self._chat_cursors is not None:
+                        await self._chat_cursors.handle_snapshot(frame)
                     elif t == FRAME_CHAT_MESSAGE:
                         await self._handle_chat_message(frame)
                     elif t == FRAME_CHAT_ACTION:
@@ -274,6 +295,8 @@ def make_adapter_class():
                 return False
             self._client = client
             self._instance_id = ready.instance_id
+            if hasattr(self._chat_event_logs, "set_event_loop"):
+                self._chat_event_logs.set_event_loop(asyncio.get_running_loop())
             _authorize_vylen_user(ready.user_id)
             self._response_buffers = ResponseBufferRegistry(
                 grace_seconds=_env_float("VYLEN_RESUME_GRACE_SECONDS", 300.0),
@@ -283,7 +306,7 @@ def make_adapter_class():
             self._response_sweep_task = asyncio.create_task(
                 _sweep_loop(self._response_buffers, sweep_interval, label="response buffer")
             )
-            chat_sweep_interval = _env_float("VYLEN_CHAT_CURSOR_SWEEP_SECONDS", 60.0)
+            chat_sweep_interval = _env_float("VYLEN_CHAT_STATE_GC_INTERVAL_SECONDS", 3600.0)
             self._chat_sweep_task = asyncio.create_task(
                 _sweep_loop(self._chat_event_logs, chat_sweep_interval, label="chat event log")
             )
@@ -297,7 +320,7 @@ def make_adapter_class():
                 self._chat_event_logs,
                 disabled=bool(os.environ.get("VYLEN_CHAT_CURSOR_DISABLE")),
             )
-            self._health = HealthReporter(client.send)
+            self._health = HealthReporter(client.send, chat_state_status=lambda: self._chat_event_logs.status)
             self._health.start()
             self._transcribe = Transcriber(client.send)
             self._memory = MemoryRPC(client.send)
@@ -322,6 +345,13 @@ def make_adapter_class():
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
                 self._chat_sweep_task = None
+            if self._chat_sweep_request_task:
+                self._chat_sweep_request_task.cancel()
+                try:
+                    await self._chat_sweep_request_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                self._chat_sweep_request_task = None
             for task in tuple(self._chat_message_tasks):
                 task.cancel()
             if self._chat_message_tasks:
@@ -366,7 +396,7 @@ def make_adapter_class():
                 if progress:
                     message_id = _message_id("activity")
                     self._activity_groups_by_message[message_id] = progress
-                    self._emit_tool_progress(str(chat_id), active_turn["turn_id"], message_id, progress)
+                    await self._emit_tool_progress(str(chat_id), active_turn["turn_id"], message_id, progress)
                     return SendResult(success=True, message_id=message_id)
                 message_id = self._activity_message_by_turn.pop(active_turn["turn_id"], "") or _message_id("asst")
                 payload = {
@@ -383,7 +413,7 @@ def make_adapter_class():
                         if message_id in self._assistant_turn_by_message
                         else "message.created"
                     )
-                    self._append_chat_event(str(chat_id), event_kind, payload)
+                    await self._append_chat_event_async(str(chat_id), event_kind, payload)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("vylen gateway: retained assistant send failed: %s", exc)
                     return SendResult(success=False, error=str(exc))
@@ -448,7 +478,7 @@ def make_adapter_class():
                     if turn_id in self._cancelled_turns:
                         return SendResult(success=False, error="turn cancelled")
                     self._activity_groups_by_message[str(message_id)] = progress
-                    self._emit_tool_progress(str(chat_id), turn_id, str(message_id), progress)
+                    await self._emit_tool_progress(str(chat_id), turn_id, str(message_id), progress)
                     return SendResult(success=True, message_id=str(message_id))
 
             payload: dict[str, Any] = {
@@ -463,7 +493,7 @@ def make_adapter_class():
                     return SendResult(success=False, error="turn cancelled")
                 payload["turn_id"] = turn_id
             try:
-                self._append_chat_event(str(chat_id), "message.updated", payload)
+                await self._append_chat_event_async(str(chat_id), "message.updated", payload)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("vylen gateway: retained assistant edit failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
@@ -474,7 +504,7 @@ def make_adapter_class():
             turn_id = self._assistant_turn_by_message.get(str(message_id))
             if turn_id:
                 payload["turn_id"] = turn_id
-            self._append_chat_event(str(chat_id), "message.deleted", payload)
+            await self._append_chat_event_async(str(chat_id), "message.deleted", payload)
             return True
 
         async def on_processing_start(self, event) -> None:
@@ -493,13 +523,13 @@ def make_adapter_class():
             task = asyncio.current_task()
             if task is not None:
                 self._turns_by_task[task] = {"chat_id": chat_id, **active}
-            self._append_chat_event(chat_id, "turn.started", {
+            await self._append_chat_event_async(chat_id, "turn.started", {
                 "turn_id": turn_id,
                 "message_id": user_message_id,
                 "started_at": _utc_iso(),
             })
             if user_message_id:
-                self._append_chat_event(chat_id, "message.updated", {
+                await self._append_chat_event_async(chat_id, "message.updated", {
                     "message_id": user_message_id,
                     "turn_id": turn_id,
                     "status": "running",
@@ -551,13 +581,13 @@ def make_adapter_class():
                     "completed_at": _utc_iso(),
                 }
                 status = "completed"
-            self._append_chat_event(chat_id, kind, payload)
+            await self._append_chat_event_async(chat_id, kind, payload)
             for activity_id in self._activity_ids_by_turn.pop(turn_id, set()):
                 if self._activity_status_by_id.get(activity_id) in {"completed", "failed"}:
                     self._activity_payloads_by_id.pop(activity_id, None)
                     self._activity_status_by_id.pop(activity_id, None)
                     continue
-                self._append_activity_terminal(
+                await self._append_activity_terminal(
                     chat_id,
                     turn_id,
                     activity_id,
@@ -566,14 +596,14 @@ def make_adapter_class():
                 self._activity_payloads_by_id.pop(activity_id, None)
                 self._activity_status_by_id.pop(activity_id, None)
             for assistant_message_id in self._assistant_messages_by_turn.pop(turn_id, set()):
-                self._append_chat_event(chat_id, "message.updated", {
+                await self._append_chat_event_async(chat_id, "message.updated", {
                     "message_id": assistant_message_id,
                     "turn_id": turn_id,
                     "status": status,
                     "updated_at": _utc_iso(),
                 })
             if user_message_id:
-                self._append_chat_event(chat_id, "message.updated", {
+                await self._append_chat_event_async(chat_id, "message.updated", {
                     "message_id": user_message_id,
                     "turn_id": turn_id,
                     "status": status,
@@ -594,7 +624,7 @@ def make_adapter_class():
         ):
             from gateway.platforms.base import SendResult
 
-            return self._create_action_card(
+            return await self._create_action_card(
                 chat_id=chat_id,
                 kind="approval",
                 event_kind="approval.requested",
@@ -627,7 +657,7 @@ def make_adapter_class():
                     timeout=self._action_ttl_seconds,
                 )
                 return SendResult(success=True, message_id=_message_id("confirm"))
-            return self._create_action_card(
+            return await self._create_action_card(
                 chat_id=chat_id,
                 kind="confirm",
                 event_kind="confirm.requested",
@@ -704,7 +734,7 @@ def make_adapter_class():
                     }],
                 }
                 try:
-                    self._append_chat_event(str(chat_id), "message.created", payload)
+                    await self._append_chat_event_async(str(chat_id), "message.created", payload)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("vylen gateway: retained image message failed: %s", exc)
                     return SendResult(success=False, error=str(exc))
@@ -739,7 +769,7 @@ def make_adapter_class():
         async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
             return {"name": "vylen", "type": "dm"}
 
-        def _create_action_card(
+        async def _create_action_card(
             self,
             *,
             chat_id: str,
@@ -784,7 +814,7 @@ def make_adapter_class():
             }
             if kind == "confirm" and not retained_payload.get("confirm_id"):
                 retained_payload["confirm_id"] = resolved_action_id
-            self._append_chat_event(str(chat_id), event_kind, retained_payload)
+            await self._append_chat_event_async(str(chat_id), event_kind, retained_payload)
             return SendResult(success=True, message_id=message_id)
 
         async def _handle_chat_message(self, frame: dict[str, Any]) -> None:
@@ -797,9 +827,8 @@ def make_adapter_class():
                 return
 
             dedup_key = (chat_id, client_message_id)
-            existing = self._accepted_chat_messages.get(dedup_key)
+            existing = await self._chat_dedup_lookup_async(chat_id, client_message_id)
             if existing is not None:
-                self._accepted_chat_messages.move_to_end(dedup_key)
                 await self._send_frame({
                     "type": FRAME_CHAT_MESSAGE_ACK,
                     "request_id": request_id,
@@ -849,16 +878,12 @@ def make_adapter_class():
                 "accepted_at": time.time(),
                 "source": event.source,
             }
-            self._accepted_chat_messages[dedup_key] = accepted
-            self._accepted_chat_messages.move_to_end(dedup_key)
-            while len(self._accepted_chat_messages) > self._accepted_chat_messages_max:
-                self._accepted_chat_messages.popitem(last=False)
             author = {
                 "id": user_id,
                 "name": str(frame.get("user_name") or user_id),
             }
             try:
-                self._append_chat_event(chat_id, "message.created", {
+                await self._append_chat_event_async(chat_id, "message.created", {
                     "message_id": user_message_id,
                     "role": "user",
                     "text": text,
@@ -867,22 +892,24 @@ def make_adapter_class():
                     "turn_id": turn_id,
                     "client_message_id": client_message_id,
                     "origin_client_id": str(frame.get("client_id") or ""),
+                    "chat_name": str(frame.get("chat_name") or ""),
                     "author": author,
                     "attachments": attachments,
                 })
+                await self._chat_dedup_record_async(chat_id, client_message_id, accepted)
             except Exception as exc:  # noqa: BLE001
-                self._accepted_chat_messages.pop(dedup_key, None)
-                await self._send_chat_message_error(frame, "CHAT_EVENT_TOO_LARGE", str(exc))
+                await self._chat_dedup_forget_async(chat_id, client_message_id)
+                await self._send_chat_message_error(frame, _chat_state_error_code(exc), str(exc))
                 return
 
             if queue_instead_of_interrupt:
-                self._append_chat_event(chat_id, "turn.queued", {
+                await self._append_chat_event_async(chat_id, "turn.queued", {
                     "turn_id": turn_id,
                     "message_id": user_message_id,
                     "queued_at": _utc_iso(),
                 })
                 self._enqueue_message_event(event)
-                self._append_session_status(chat_id, source=event.source)
+                await self._append_session_status(chat_id, source=event.source)
             else:
                 self._active_turns_by_chat[chat_id] = self._active_turn_for_event(event)
 
@@ -902,7 +929,7 @@ def make_adapter_class():
             task = asyncio.create_task(self._process_chat_message(chat_id, user_message_id, turn_id, event))
             self._chat_message_tasks.add(task)
             task.add_done_callback(self._chat_message_tasks.discard)
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.1)
 
         async def _process_chat_message(self, chat_id: str, user_message_id: str, turn_id: str, event: Any) -> None:
             if turn_id in self._cancelled_turns:
@@ -911,13 +938,13 @@ def make_adapter_class():
             try:
                 await self.handle_message(event)
             except Exception as exc:  # noqa: BLE001
-                self._append_chat_event(chat_id, "turn.failed", {
+                await self._append_chat_event_async(chat_id, "turn.failed", {
                     "turn_id": turn_id,
                     "message_id": user_message_id,
                     "error": str(exc),
                     "failed_at": _utc_iso(),
                 })
-                self._append_chat_event(chat_id, "message.updated", {
+                await self._append_chat_event_async(chat_id, "message.updated", {
                     "message_id": user_message_id,
                     "turn_id": turn_id,
                     "status": "failed",
@@ -945,48 +972,51 @@ def make_adapter_class():
             }
             if source is not None:
                 accepted["source"] = source
-            self._accepted_chat_messages[dedup_key] = accepted
-            self._accepted_chat_messages.move_to_end(dedup_key)
-            while len(self._accepted_chat_messages) > self._accepted_chat_messages_max:
-                self._accepted_chat_messages.popitem(last=False)
 
             if command == "status":
-                self._append_session_status(chat_id, source=source)
                 try:
+                    await self._chat_dedup_record_async(chat_id, client_message_id, accepted)
+                    await self._append_session_status(chat_id, source=source)
                     await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
                 except Exception as exc:  # noqa: BLE001
-                    self._accepted_chat_messages.pop(dedup_key, None)
-                    await self._send_chat_message_error(frame, "SESSION_STATUS_FAILED", str(exc))
+                    await self._chat_dedup_forget_async(chat_id, client_message_id)
+                    await self._send_chat_message_error(frame, _chat_state_error_code(exc, fallback="SESSION_STATUS_FAILED"), str(exc))
                     return
             elif command == "reset":
                 active = self._active_turns_by_chat.get(chat_id)
                 if active is not None:
-                    self._accepted_chat_messages.pop(dedup_key, None)
+                    await self._chat_dedup_forget_async(chat_id, client_message_id)
                     await self._send_chat_message_error(frame, "TURN_ACTIVE", "Stop the current run first")
                     return
                 if source is None:
-                    self._accepted_chat_messages.pop(dedup_key, None)
+                    await self._chat_dedup_forget_async(chat_id, client_message_id)
                     await self._send_chat_message_error(frame, "SESSION_SOURCE_UNAVAILABLE", "Could not route session reset")
                     return
-                self._create_action_card(
-                    chat_id=chat_id,
-                    kind="confirm",
-                    event_kind="confirm.requested",
-                    session_key=self._session_key_for_source(source),
-                    payload={
-                        "title": "Reset chat history",
-                        "message": "Hermes will forget the conversation above. Your messages stay visible to you.",
-                        "choices": ["once", "cancel"],
-                        "confirm_id": "",
-                    },
-                    message_prefix="confirm",
-                    record_extra={
-                        "native_action": "session.reset",
-                        "source": source,
-                    },
-                )
+                try:
+                    await self._chat_dedup_record_async(chat_id, client_message_id, accepted)
+                    await self._create_action_card(
+                        chat_id=chat_id,
+                        kind="confirm",
+                        event_kind="confirm.requested",
+                        session_key=self._session_key_for_source(source),
+                        payload={
+                            "title": "Reset chat history",
+                            "message": "Hermes will forget the conversation above. Your messages stay visible to you.",
+                            "choices": ["once", "cancel"],
+                            "confirm_id": "",
+                        },
+                        message_prefix="confirm",
+                        record_extra={
+                            "native_action": "session.reset",
+                            "source": source,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    await self._chat_dedup_forget_async(chat_id, client_message_id)
+                    await self._send_chat_message_error(frame, _chat_state_error_code(exc), str(exc))
+                    return
             elif command == "queue":
-                self._accepted_chat_messages.pop(dedup_key, None)
+                await self._chat_dedup_forget_async(chat_id, client_message_id)
                 frame = dict(frame)
                 frame["text"] = args
                 await self._handle_message_control_action(
@@ -999,7 +1029,7 @@ def make_adapter_class():
                 )
                 return
             elif command == "steer":
-                self._accepted_chat_messages.pop(dedup_key, None)
+                await self._chat_dedup_forget_async(chat_id, client_message_id)
                 frame = dict(frame)
                 frame["text"] = args
                 await self._handle_message_control_action(
@@ -1012,7 +1042,7 @@ def make_adapter_class():
                 )
                 return
             else:
-                self._accepted_chat_messages.pop(dedup_key, None)
+                await self._chat_dedup_forget_async(chat_id, client_message_id)
                 await self._send_chat_message_error(frame, "CHAT_MESSAGE_INVALID", "unsupported native command")
                 return
 
@@ -1036,9 +1066,8 @@ def make_adapter_class():
             ack_type: str,
         ) -> None:
             dedup_key = (chat_id, client_message_id)
-            existing = self._accepted_chat_messages.get(dedup_key)
+            existing = await self._chat_dedup_lookup_async(chat_id, client_message_id)
             if existing is not None:
-                self._accepted_chat_messages.move_to_end(dedup_key)
                 await self._send_frame({
                     "type": ack_type,
                     "request_id": request_id,
@@ -1097,7 +1126,7 @@ def make_adapter_class():
                 "name": str(frame.get("user_name") or frame.get("user_id") or ""),
             }
             try:
-                self._append_chat_event(chat_id, "message.created", {
+                await self._append_chat_event_async(chat_id, "message.created", {
                     "message_id": user_message_id,
                     "role": "user",
                     "text": text,
@@ -1111,9 +1140,8 @@ def make_adapter_class():
                     "intent": control,
                 })
             except Exception as exc:  # noqa: BLE001
-                await self._send_message_control_error(frame, ack_type, "CHAT_EVENT_TOO_LARGE", str(exc))
+                await self._send_message_control_error(frame, ack_type, _chat_state_error_code(exc), str(exc))
                 return
-
             if control == "steer":
                 fallback_pending = False
                 session_key = self._session_key_for_source(source)
@@ -1126,7 +1154,7 @@ def make_adapter_class():
                         suppress_confirm=False,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    self._append_chat_event(chat_id, "message.updated", {
+                    await self._append_chat_event_async(chat_id, "message.updated", {
                         "message_id": user_message_id,
                         "turn_id": turn_id,
                         "status": "failed",
@@ -1136,7 +1164,7 @@ def make_adapter_class():
                     await self._send_message_control_error(frame, ack_type, "STEER_FAILED", str(exc))
                     return
                 if not dispatched:
-                    self._append_chat_event(chat_id, "message.updated", {
+                    await self._append_chat_event_async(chat_id, "message.updated", {
                         "message_id": user_message_id,
                         "turn_id": turn_id,
                         "status": "failed",
@@ -1167,27 +1195,27 @@ def make_adapter_class():
                 if fallback_pending:
                     control = "queue"
                     status = "queued"
-                    self._append_chat_event(chat_id, "message.updated", {
+                    await self._append_chat_event_async(chat_id, "message.updated", {
                         "message_id": user_message_id,
                         "turn_id": turn_id,
                         "status": "queued",
                         "intent": "queue",
                         "updated_at": _utc_iso(),
                     })
-                    self._append_chat_event(chat_id, "turn.queued", {
+                    await self._append_chat_event_async(chat_id, "turn.queued", {
                         "turn_id": turn_id,
                         "message_id": user_message_id,
                         "queued_at": _utc_iso(),
                     })
-                    self._append_session_status(chat_id, source=event.source)
+                    await self._append_session_status(chat_id, source=event.source)
             elif queued:
-                self._append_chat_event(chat_id, "turn.queued", {
+                await self._append_chat_event_async(chat_id, "turn.queued", {
                     "turn_id": turn_id,
                     "message_id": user_message_id,
                     "queued_at": _utc_iso(),
                 })
                 self._enqueue_message_event(event)
-                self._append_session_status(chat_id, source=event.source)
+                await self._append_session_status(chat_id, source=event.source)
             else:
                 self._active_turns_by_chat[chat_id] = self._active_turn_for_event(event)
                 task = asyncio.create_task(self._process_chat_message(chat_id, user_message_id, turn_id, event))
@@ -1202,10 +1230,11 @@ def make_adapter_class():
                 "intent": control,
                 "message_status": status,
             }
-            self._accepted_chat_messages[dedup_key] = accepted
-            self._accepted_chat_messages.move_to_end(dedup_key)
-            while len(self._accepted_chat_messages) > self._accepted_chat_messages_max:
-                self._accepted_chat_messages.popitem(last=False)
+            try:
+                await self._chat_dedup_record_async(chat_id, client_message_id, accepted)
+            except Exception as exc:  # noqa: BLE001
+                await self._send_message_control_error(frame, ack_type, _chat_state_error_code(exc), str(exc))
+                return
 
             await self._send_frame({
                 "type": ack_type,
@@ -1218,7 +1247,7 @@ def make_adapter_class():
                 "message_status": status,
                 "accepted": True,
             })
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.1)
 
         async def _handle_chat_action(self, frame: dict[str, Any]) -> None:
             request_id = _safe_id(frame.get("request_id"))
@@ -1241,7 +1270,7 @@ def make_adapter_class():
                     active.pop("cancel_requested", None)
                     await self._send_chat_action_error(frame, "TURN_CANCEL_FAILED", str(exc))
                     return
-                self._cancel_active_turn(chat_id, active, reason="user_stop")
+                await self._cancel_active_turn(chat_id, active, reason="user_stop")
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
                     "request_id": request_id,
@@ -1250,13 +1279,32 @@ def make_adapter_class():
                     "accepted": True,
                 })
                 return
+            if action == "chat.delete":
+                try:
+                    if hasattr(self._chat_event_logs, "mark_deleted"):
+                        await asyncio.to_thread(self._chat_event_logs.mark_deleted, chat_id)
+                    else:
+                        await self._append_chat_event_async(chat_id, "chat.deleted", {
+                            "chat_id": chat_id,
+                            "deleted_at": _utc_iso(),
+                        })
+                except Exception as exc:  # noqa: BLE001
+                    await self._send_chat_action_error(frame, _chat_state_error_code(exc), str(exc))
+                    return
+                await self._send_frame({
+                    "type": FRAME_CHAT_ACTION_ACK,
+                    "request_id": request_id,
+                    "chat_id": chat_id,
+                    "accepted": True,
+                })
+                return
             if action == "session.status":
                 source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
-                self._append_session_status(chat_id, source=source)
                 try:
+                    await self._append_session_status(chat_id, source=source)
                     await self._dispatch_native_command(frame, chat_id, "/status", suppress_confirm=False)
                 except Exception as exc:  # noqa: BLE001
-                    await self._send_chat_action_error(frame, "SESSION_STATUS_FAILED", str(exc))
+                    await self._send_chat_action_error(frame, _chat_state_error_code(exc, fallback="SESSION_STATUS_FAILED"), str(exc))
                     return
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
@@ -1267,7 +1315,11 @@ def make_adapter_class():
                 return
             if action == "session.controls":
                 source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
-                self._append_session_controls(chat_id, source=source)
+                try:
+                    await self._append_session_controls(chat_id, source=source)
+                except Exception as exc:  # noqa: BLE001
+                    await self._send_chat_action_error(frame, _chat_state_error_code(exc), str(exc))
+                    return
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
                     "request_id": request_id,
@@ -1298,7 +1350,11 @@ def make_adapter_class():
                 if not dispatched:
                     await self._send_chat_action_error(frame, "SESSION_SOURCE_UNAVAILABLE", "Could not route reasoning command")
                     return
-                self._append_session_controls(chat_id, source=source)
+                try:
+                    await self._append_session_controls(chat_id, source=source)
+                except Exception as exc:  # noqa: BLE001
+                    await self._send_chat_action_error(frame, _chat_state_error_code(exc), str(exc))
+                    return
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
                     "request_id": request_id,
@@ -1326,13 +1382,13 @@ def make_adapter_class():
                 if not dispatched:
                     await self._send_chat_action_error(frame, "SESSION_SOURCE_UNAVAILABLE", "Could not route session reset")
                     return
-                self._append_chat_event(chat_id, "session.reset", {
+                await self._append_chat_event_async(chat_id, "session.reset", {
                     "message_id": _message_id("reset"),
                     "text": "Cleared history",
                     "cleared_at": _utc_iso(),
                 })
                 source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
-                self._append_session_status(chat_id, source=source)
+                await self._append_session_status(chat_id, source=source)
                 await self._send_frame({
                     "type": FRAME_CHAT_ACTION_ACK,
                     "request_id": request_id,
@@ -1364,7 +1420,7 @@ def make_adapter_class():
                 await self._send_chat_action_error(frame, "STALE_ACTION", "This action is no longer available")
                 return
             if float(record.get("expires_at") or 0) <= time.time():
-                self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="stale_action")
+                await self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="stale_action")
                 await self._send_chat_action_error(frame, "STALE_ACTION", "This action is no longer available")
                 return
 
@@ -1385,7 +1441,7 @@ def make_adapter_class():
 
                     resolved_count = resolve_gateway_approval(record["session_key"], choice)
                     if not resolved_count:
-                        self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="resolver_lost")
+                        await self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="resolver_lost")
                         await self._send_chat_action_error(frame, "STALE_ACTION", "This approval is no longer available")
                         return
                 elif record.get("native_action") == "session.reset":
@@ -1409,19 +1465,19 @@ def make_adapter_class():
                                 "Could not route session reset",
                             )
                             return
-                        self._append_chat_event(chat_id, "session.reset", {
+                        await self._append_chat_event_async(chat_id, "session.reset", {
                             "message_id": _message_id("reset"),
                             "text": "Cleared history",
                             "cleared_at": _utc_iso(),
                         })
                         source = record.get("source")
-                        self._append_session_status(chat_id, source=source)
+                        await self._append_session_status(chat_id, source=source)
                 else:
                     from tools import slash_confirm as _slash_confirm_mod
 
                     pending = _slash_confirm_mod.get_pending(record["session_key"])
                     if not pending or pending.get("confirm_id") != action_id:
-                        self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="resolver_lost")
+                        await self._emit_action_expired(chat_id, action_id, expected_kind, record, reason="resolver_lost")
                         await self._send_chat_action_error(frame, "STALE_ACTION", "This confirmation is no longer available")
                         return
                     follow_up = await _slash_confirm_mod.resolve(
@@ -1431,7 +1487,7 @@ def make_adapter_class():
                         timeout=self._action_ttl_seconds,
                     )
                     if follow_up:
-                        self._append_assistant_message(chat_id, follow_up, record.get("turn_id"))
+                        await self._append_assistant_message(chat_id, follow_up, record.get("turn_id"))
             except Exception as exc:  # noqa: BLE001
                 await self._send_chat_action_error(frame, "ACTION_RESOLVE_FAILED", str(exc))
                 return
@@ -1447,7 +1503,7 @@ def make_adapter_class():
             }
             if expected_kind == "approval":
                 payload["resolved"] = choice != "deny"
-            self._append_chat_event(chat_id, resolved_kind, payload)
+            await self._append_chat_event_async(chat_id, resolved_kind, payload)
             await self._send_frame({
                 "type": FRAME_CHAT_ACTION_ACK,
                 "request_id": request_id,
@@ -1578,7 +1634,7 @@ def make_adapter_class():
                 })
             return {"paths": paths, "types": media_types, "public": public}
 
-        def _append_assistant_message(self, chat_id: str, text: str, turn_id: str | None) -> str:
+        async def _append_assistant_message(self, chat_id: str, text: str, turn_id: str | None) -> str:
             message_id = _message_id("asst")
             payload: dict[str, Any] = {
                 "message_id": message_id,
@@ -1591,22 +1647,107 @@ def make_adapter_class():
                 payload["turn_id"] = turn_id
                 self._assistant_turn_by_message[message_id] = turn_id
                 self._assistant_messages_by_turn.setdefault(turn_id, set()).add(message_id)
-            self._append_chat_event(chat_id, "message.created", payload)
+            await self._append_chat_event_async(chat_id, "message.created", payload)
             return message_id
 
-        def _append_chat_event(self, chat_id: str, kind: str, payload: dict[str, Any]) -> int | None:
+        def _append_chat_event_sync(self, chat_id: str, kind: str, payload: dict[str, Any]) -> int | None:
             if self._chat_cursors is not None:
-                return self._chat_cursors.append_event(chat_id, kind, payload)
+                seq = self._chat_cursors.append_event(chat_id, kind, payload)
+                self._maybe_schedule_chat_state_sweep()
+                return seq
             event = self._chat_event_logs.get_or_create(chat_id).append(kind, payload)
+            self._maybe_schedule_chat_state_sweep()
             return event.seq
 
-        def _cancel_active_turn(self, chat_id: str, active: dict[str, Any], *, reason: str) -> None:
+        def _append_chat_event(self, chat_id: str, kind: str, payload: dict[str, Any]) -> int | None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return self._append_chat_event_sync(chat_id, kind, payload)
+            asyncio.create_task(self._append_chat_event_async(chat_id, kind, payload))
+            return None
+
+        async def _append_chat_event_async(self, chat_id: str, kind: str, payload: dict[str, Any]) -> int | None:
+            seq = await asyncio.to_thread(self._append_chat_event_sync, chat_id, kind, payload)
+            self._maybe_schedule_chat_state_sweep()
+            return seq
+
+        def _maybe_schedule_chat_state_sweep(self) -> None:
+            if not hasattr(self._chat_event_logs, "consume_sweep_requested"):
+                return
+            try:
+                requested = self._chat_event_logs.consume_sweep_requested()
+            except Exception:  # noqa: BLE001
+                return
+            if not requested:
+                return
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            if self._chat_sweep_request_task is not None and not self._chat_sweep_request_task.done():
+                return
+            self._chat_sweep_request_task = asyncio.create_task(
+                _run_single_sweep(self._chat_event_logs, label="chat event log")
+            )
+
+        def _chat_dedup_lookup(self, chat_id: str, client_message_id: str) -> dict[str, Any] | None:
+            dedup_key = (chat_id, client_message_id)
+            existing = self._accepted_chat_messages.get(dedup_key)
+            if existing is not None:
+                self._accepted_chat_messages.move_to_end(dedup_key)
+                return existing
+            if hasattr(self._chat_event_logs, "dedup_lookup"):
+                try:
+                    return self._chat_event_logs.dedup_lookup(chat_id, client_message_id)
+                except Exception:  # noqa: BLE001
+                    return None
+            return None
+
+        async def _chat_dedup_lookup_async(self, chat_id: str, client_message_id: str) -> dict[str, Any] | None:
+            return await asyncio.to_thread(self._chat_dedup_lookup, chat_id, client_message_id)
+
+        def _chat_dedup_record(self, chat_id: str, client_message_id: str, accepted: dict[str, Any]) -> None:
+            dedup_key = (chat_id, client_message_id)
+            if hasattr(self._chat_event_logs, "dedup_record"):
+                self._chat_event_logs.dedup_record(
+                    chat_id,
+                    client_message_id,
+                    turn_id=str(accepted.get("turn_id") or ""),
+                    message_id=str(accepted.get("user_message_id") or ""),
+                    payload={
+                        "turn_id": str(accepted.get("turn_id") or ""),
+                        "user_message_id": str(accepted.get("user_message_id") or ""),
+                        "intent": str(accepted.get("intent") or ""),
+                        "message_status": str(accepted.get("message_status") or ""),
+                    },
+                )
+            self._accepted_chat_messages[dedup_key] = accepted
+            self._accepted_chat_messages.move_to_end(dedup_key)
+            while len(self._accepted_chat_messages) > self._accepted_chat_messages_max:
+                self._accepted_chat_messages.popitem(last=False)
+
+        async def _chat_dedup_record_async(self, chat_id: str, client_message_id: str, accepted: dict[str, Any]) -> None:
+            await asyncio.to_thread(self._chat_dedup_record, chat_id, client_message_id, accepted)
+
+        def _chat_dedup_forget(self, chat_id: str, client_message_id: str) -> None:
+            self._accepted_chat_messages.pop((chat_id, client_message_id), None)
+            if hasattr(self._chat_event_logs, "dedup_forget"):
+                try:
+                    self._chat_event_logs.dedup_forget(chat_id, client_message_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        async def _chat_dedup_forget_async(self, chat_id: str, client_message_id: str) -> None:
+            await asyncio.to_thread(self._chat_dedup_forget, chat_id, client_message_id)
+
+        async def _cancel_active_turn(self, chat_id: str, active: dict[str, Any], *, reason: str) -> None:
             turn_id = str(active.get("turn_id") or "")
             if not turn_id or turn_id in self._cancelled_turns:
                 return
             self._cancelled_turns.add(turn_id)
             active["cancelled"] = True
-            self._append_chat_event(chat_id, "turn.cancelled", {
+            await self._append_chat_event_async(chat_id, "turn.cancelled", {
                 "turn_id": turn_id,
                 "message_id": str(active.get("message_id") or ""),
                 "reason": reason,
@@ -1618,7 +1759,7 @@ def make_adapter_class():
                 self._assistant_turn_by_message[message_id] = turn_id
                 self._assistant_messages_by_turn.setdefault(turn_id, set()).add(message_id)
                 assistant_ids = {message_id}
-                self._append_chat_event(chat_id, "message.created", {
+                await self._append_chat_event_async(chat_id, "message.created", {
                     "message_id": message_id,
                     "role": "hermes",
                     "text": "",
@@ -1628,7 +1769,7 @@ def make_adapter_class():
                 })
             else:
                 for message_id in assistant_ids:
-                    self._append_chat_event(chat_id, "message.updated", {
+                    await self._append_chat_event_async(chat_id, "message.updated", {
                         "message_id": message_id,
                         "turn_id": turn_id,
                         "status": "cancelled",
@@ -1639,7 +1780,7 @@ def make_adapter_class():
                     self._activity_payloads_by_id.pop(activity_id, None)
                     self._activity_status_by_id.pop(activity_id, None)
                     continue
-                self._append_activity_terminal(
+                await self._append_activity_terminal(
                     chat_id,
                     turn_id,
                     activity_id,
@@ -1787,7 +1928,7 @@ def make_adapter_class():
                 thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             )
 
-        def _append_session_status(self, chat_id: str, *, source: Any | None = None) -> None:
+        async def _append_session_status(self, chat_id: str, *, source: Any | None = None) -> None:
             active = self._active_turns_by_chat.get(chat_id)
             source = source or self._source_for_chat(chat_id)
             session_key = self._session_key_for_source(source) if source is not None else ""
@@ -1798,7 +1939,7 @@ def make_adapter_class():
                 if self._activity_status_by_id.get(activity_id) == "running"
             ] if active_turn_id else []
             queued, queued_exact = self._queue_depth_for_session(session_key)
-            self._append_chat_event(chat_id, "session.status", {
+            await self._append_chat_event_async(chat_id, "session.status", {
                 "status_id": _message_id("status"),
                 "state": "running" if active_turn_id else ("queued" if queued else "idle"),
                 "running": bool(active_turn_id),
@@ -1809,12 +1950,12 @@ def make_adapter_class():
                 "updated_at": _utc_iso(),
             })
 
-        def _append_session_controls(self, chat_id: str, *, source: Any | None = None) -> None:
+        async def _append_session_controls(self, chat_id: str, *, source: Any | None = None) -> None:
             source = source or self._source_for_chat(chat_id)
             session_key = self._session_key_for_source(source) if source is not None else ""
             model, provider = self._current_model_provider(source, session_key)
             effort, scope, display = self._current_reasoning_controls(source, session_key)
-            self._append_chat_event(chat_id, "session.controls", {
+            await self._append_chat_event_async(chat_id, "session.controls", {
                 "controls_id": _message_id("controls"),
                 "model": model,
                 "provider": provider,
@@ -2038,14 +2179,14 @@ def make_adapter_class():
                 "source": event.source,
             }
 
-        def _emit_tool_progress(
+        async def _emit_tool_progress(
             self,
             chat_id: str,
             turn_id: str,
             progress_message_id: str,
             progress: list[dict[str, str]],
         ) -> None:
-            target_message_id = self._ensure_activity_message(chat_id, turn_id)
+            target_message_id = await self._ensure_activity_message(chat_id, turn_id)
             seen: set[str] = set()
             current_ids: list[str] = []
             for index, item in enumerate(progress):
@@ -2076,11 +2217,11 @@ def make_adapter_class():
                     payload["updated_at"] = _utc_iso()
                     event_kind = "activity.updated"
                 self._activity_status_by_id[activity_id] = "running"
-                self._append_chat_event(chat_id, event_kind, payload)
+                await self._append_chat_event_async(chat_id, event_kind, payload)
             for activity_id in current_ids[:-1]:
                 if self._activity_status_by_id.get(activity_id) != "running":
                     continue
-                self._append_activity_terminal(
+                await self._append_activity_terminal(
                     chat_id,
                     turn_id,
                     activity_id,
@@ -2088,7 +2229,7 @@ def make_adapter_class():
                     message_id=target_message_id,
                 )
 
-        def _append_activity_terminal(
+        async def _append_activity_terminal(
             self,
             chat_id: str,
             turn_id: str,
@@ -2109,9 +2250,9 @@ def make_adapter_class():
             if error:
                 payload["error"] = error
             self._activity_status_by_id[activity_id] = status
-            self._append_chat_event(chat_id, "activity.completed", payload)
+            await self._append_chat_event_async(chat_id, "activity.completed", payload)
 
-        def _ensure_activity_message(self, chat_id: str, turn_id: str) -> str:
+        async def _ensure_activity_message(self, chat_id: str, turn_id: str) -> str:
             existing = self._activity_message_by_turn.get(turn_id)
             if existing:
                 return existing
@@ -2124,7 +2265,7 @@ def make_adapter_class():
             self._activity_message_by_turn[turn_id] = message_id
             self._assistant_turn_by_message[message_id] = turn_id
             self._assistant_messages_by_turn.setdefault(turn_id, set()).add(message_id)
-            self._append_chat_event(chat_id, "message.created", {
+            await self._append_chat_event_async(chat_id, "message.created", {
                 "message_id": message_id,
                 "role": "hermes",
                 "text": "",
@@ -2134,7 +2275,7 @@ def make_adapter_class():
             })
             return message_id
 
-        def _emit_action_expired(
+        async def _emit_action_expired(
             self,
             chat_id: str,
             action_id: str,
@@ -2153,7 +2294,7 @@ def make_adapter_class():
                 "reason": reason,
                 "updated_at": _utc_iso(),
             }
-            self._append_chat_event(chat_id, event_kind, payload)
+            await self._append_chat_event_async(chat_id, event_kind, payload)
             if record is not None:
                 record["expired_emitted"] = True
                 self._action_cards.pop(action_id, None)
@@ -2302,6 +2443,16 @@ def _parse_tool_progress(content: Any) -> list[dict[str, str]]:
             "label": label,
         })
     return parsed
+
+
+def _chat_state_error_code(exc: Exception, *, fallback: str = "CHAT_STATE_UNAVAILABLE") -> str:
+    if isinstance(exc, EventTooLarge):
+        return "CHAT_EVENT_TOO_LARGE"
+    if isinstance(exc, ChatStateUnavailable):
+        return exc.code
+    if isinstance(exc, InvalidChatStateEvent):
+        return exc.code
+    return fallback
 
 
 def _activity_id(

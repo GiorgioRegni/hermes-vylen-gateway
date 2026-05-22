@@ -6,9 +6,13 @@ import pytest
 
 from hermes_vylen_gateway.chat_cursor import (
     FRAME_CHAT_EVENT,
+    FRAME_CHAT_SNAPSHOT_ERROR,
+    FRAME_CHAT_LIST_RESPONSE,
     FRAME_CHAT_RESUME_EXPIRED,
+    FRAME_CHAT_SNAPSHOT_RESPONSE,
     ChatCursorRelay,
 )
+from hermes_vylen_gateway.chat_store import ChatStateConfig, ChatStateStore
 from hermes_vylen_gateway.event_log import EventLogRegistry
 
 
@@ -274,6 +278,72 @@ async def test_chat_subscribe_replays_generic_retained_events():
     }
 
     await relay.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_list_and_snapshot_frames_read_sqlite_store(tmp_path):
+    sent: list[dict] = []
+
+    async def send(frame: dict) -> None:
+        sent.append(frame)
+
+    store = ChatStateStore(tmp_path / "chat-state.sqlite3")
+    relay = ChatCursorRelay(send, store)
+    relay.append_event("chat_a", "message.created", {
+        "message_id": "msg_1",
+        "role": "user",
+        "text": "hello",
+    })
+
+    await relay.handle_list({
+        "type": "chat_list",
+        "request_id": "req_list",
+        "limit": 50,
+        "include_preview": False,
+    })
+    await relay.handle_snapshot({
+        "type": "chat_snapshot",
+        "request_id": "req_snapshot",
+        "chat_id": "chat_a",
+        "after_seq": 0,
+        "limit": 500,
+    })
+
+    list_response = next(frame for frame in sent if frame["type"] == FRAME_CHAT_LIST_RESPONSE)
+    assert list_response["chats"][0]["chat_id"] == "chat_a"
+    assert "preview" not in list_response["chats"][0]
+
+    snapshot_response = next(frame for frame in sent if frame["type"] == FRAME_CHAT_SNAPSHOT_RESPONSE)
+    assert snapshot_response["chat"]["chat_id"] == "chat_a"
+    assert snapshot_response["events"][0]["event"]["payload"]["text"] == "hello"
+    assert snapshot_response["next_after_seq"] == 1
+    assert snapshot_response["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_chat_snapshot_expired_cursor_uses_snapshot_error_frame(tmp_path):
+    sent: list[dict] = []
+
+    async def send(frame: dict) -> None:
+        sent.append(frame)
+
+    store = ChatStateStore(tmp_path / "chat-state.sqlite3", config=ChatStateConfig(max_events_per_chat=1))
+    relay = ChatCursorRelay(send, store)
+    relay.append_event("chat_a", "message.created", {"text": "one"})
+    relay.append_event("chat_a", "message.created", {"text": "two"})
+    store.sweep()
+
+    await relay.handle_snapshot({
+        "type": "chat_snapshot",
+        "request_id": "req_snapshot",
+        "chat_id": "chat_a",
+        "after_seq": 0,
+        "limit": 500,
+    })
+
+    error = next(frame for frame in sent if frame["type"] == FRAME_CHAT_SNAPSHOT_ERROR)
+    assert error["code"] == "CHAT_RESUME_EXPIRED"
+    assert error["floor_seq"] == 1
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ import pytest
 
 import hermes_vylen_gateway.adapter as adapter_mod
 from hermes_vylen_gateway.chat_cursor import FRAME_CHAT_EVENT, ChatCursorRelay
+from hermes_vylen_gateway.chat_store import ChatStateUnavailable
 
 
 class FakeClient:
@@ -130,7 +131,8 @@ class FakeBasePlatformAdapter:
 
 
 @pytest.fixture
-def adapter(monkeypatch):
+def adapter(monkeypatch, tmp_path):
+    monkeypatch.setenv("VYLEN_CHAT_STATE_DB_PATH", str(tmp_path / "chat-state.sqlite3"))
     gateway_mod = types.ModuleType("gateway")
     platforms_mod = types.ModuleType("gateway.platforms")
     base_mod = types.ModuleType("gateway.platforms.base")
@@ -450,6 +452,22 @@ async def test_message_steer_action_reconciles_fallback_queue(adapter):
     acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
     assert acks[-1]["intent"] == "queue"
     assert acks[-1]["message_status"] == "queued"
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "steer_retry",
+        "chat_id": "chat_a",
+        "client_id": "phone",
+        "client_message_id": "client_steer_1",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+        "action": "message.steer",
+        "text": "change direction",
+    })
+
+    retry_ack = [frame for frame in adapter._fake_client.sent if frame.get("request_id") == "steer_retry"][-1]
+    assert retry_ack["intent"] == "queue"
+    assert retry_ack["message_status"] == "queued"
 
 
 @pytest.mark.asyncio
@@ -1244,7 +1262,10 @@ async def test_retained_chat_events_replay_when_no_client_was_live(adapter):
         "client_id": "tablet",
         "after_seq": 0,
     })
-    await asyncio.sleep(0)
+    for _ in range(20):
+        if any(frame["type"] == FRAME_CHAT_EVENT for frame in adapter._fake_client.sent):
+            break
+        await asyncio.sleep(0.01)
 
     events = [frame for frame in adapter._fake_client.sent if frame["type"] == FRAME_CHAT_EVENT]
     kinds = [frame["event"]["kind"] for frame in events]
@@ -1964,3 +1985,34 @@ async def test_confirm_response_errors_when_hermes_pending_callback_is_missing(a
     assert errors[-1]["code"] == "STALE_ACTION"
     kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
     assert "confirm.expired" in kinds
+
+
+@pytest.mark.asyncio
+async def test_chat_message_reports_chat_state_unavailable(adapter):
+    adapter._chat_event_logs._unavailable = ChatStateUnavailable(
+        "chat_state_unavailable",
+        "schema version is newer",
+    )
+
+    await adapter._handle_chat_message(_chat_message_frame())
+
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_error"]
+    assert errors[-1]["code"] == "chat_state_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_chat_delete_action_appends_tombstone(adapter):
+    await adapter._append_chat_event_async("chat_a", "message.created", {"text": "hello"})
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "delete_req",
+        "chat_id": "chat_a",
+        "action": "chat.delete",
+    })
+
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert acks[-1]["request_id"] == "delete_req"
+    chat = adapter._chat_event_logs.get_chat("chat_a", include_deleted=True)
+    assert chat.deleted_at is not None
+    assert adapter._chat_event_logs.replay_after("chat_a", 0)[-1].kind == "chat.deleted"

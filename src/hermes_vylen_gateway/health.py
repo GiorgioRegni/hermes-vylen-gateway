@@ -31,9 +31,11 @@ class HealthReporter:
         self,
         send_frame: Callable[[dict[str, Any]], Awaitable[None]],
         interval_s: float | None = None,
+        chat_state_status: Callable[[], Any] | None = None,
     ):
         self._send = send_frame
         self._interval = interval_s if interval_s is not None else _interval_from_env()
+        self._chat_state_status = chat_state_status
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -75,6 +77,22 @@ class HealthReporter:
         }
         if last_error is not None:
             frame["last_error"] = last_error
+        if self._chat_state_status is not None:
+            try:
+                chat_status = self._chat_state_status()
+                status_text = str(getattr(chat_status, "status", "") or "")
+                message = getattr(chat_status, "message", None)
+                if status_text:
+                    frame["chat_state_status"] = status_text
+                if message:
+                    frame["chat_state_message"] = str(message)
+                quarantined_path = getattr(chat_status, "quarantined_path", None)
+                if quarantined_path:
+                    frame["chat_state_quarantined_path"] = str(quarantined_path)
+                if status_text and status_text not in {"ok", "initializing"} and last_error is None:
+                    frame["last_error"] = f"chat_state: {message or status_text}"
+            except Exception:  # noqa: BLE001
+                logger.debug("chat state status probe failed", exc_info=True)
         try:
             await self._send(frame)
         except Exception as exc:  # noqa: BLE001
