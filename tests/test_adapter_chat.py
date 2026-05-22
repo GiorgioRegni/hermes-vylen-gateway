@@ -37,12 +37,25 @@ class FakeSessionEntry:
 class FakeSessionStore:
     def __init__(self) -> None:
         self.appended: list[tuple[str, dict[str, Any]]] = []
+        self._db: FakeSessionDB | None = None
 
     def get_or_create_session(self, source) -> FakeSessionEntry:
         return FakeSessionEntry(session_id=f"session_{source.chat_id}_{source.user_id}")
 
     def append_to_transcript(self, session_id: str, message: dict[str, Any]) -> None:
         self.appended.append((session_id, dict(message)))
+
+
+class FakeSessionDB:
+    def __init__(self) -> None:
+        self.titles: list[tuple[str, str]] = []
+
+    def sanitize_title(self, title: str) -> str:
+        return " ".join(str(title).strip().split())[:100]
+
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        self.titles.append((session_id, title))
+        return True
 
 
 class FakeSendResult:
@@ -160,6 +173,7 @@ def adapter(monkeypatch, tmp_path):
     client = FakeClient()
     instance._instance_id = "inst_1"
     instance._client = client
+    instance._chat_event_logs.set_event_loop(asyncio.get_event_loop())
     instance._chat_cursors = ChatCursorRelay(client.send, instance._chat_event_logs)
     instance._fake_client = client
     return instance
@@ -2016,3 +2030,33 @@ async def test_chat_delete_action_appends_tombstone(adapter):
     chat = adapter._chat_event_logs.get_chat("chat_a", include_deleted=True)
     assert chat.deleted_at is not None
     assert adapter._chat_event_logs.replay_after("chat_a", 0)[-1].kind == "chat.deleted"
+
+
+@pytest.mark.asyncio
+async def test_chat_rename_action_persists_event_and_syncs_hermes_title(adapter, monkeypatch):
+    async def immediate_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "to_thread", immediate_to_thread)
+    await adapter._append_chat_event_async("chat_a", "message.created", {"text": "hello", "role": "user"})
+    db = FakeSessionDB()
+    store = FakeSessionStore()
+    store._db = db
+    adapter._session_store = store
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "rename_req",
+        "chat_id": "chat_a",
+        "action": "chat.rename",
+        "title": "  Launch   plan  ",
+        "user_id": "user_1",
+        "user_name": "Giorgio",
+    })
+
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert acks[-1]["request_id"] == "rename_req"
+    assert acks[-1]["title"] == "Launch   plan"
+    assert adapter._chat_event_logs.get_chat("chat_a").title == "Launch   plan"
+    assert adapter._chat_event_logs.replay_after("chat_a", 0)[-1].kind == "chat.renamed"
+    assert db.titles == [("session_chat_a_user_1", "Launch plan")]

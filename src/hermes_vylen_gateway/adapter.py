@@ -114,6 +114,11 @@ def _env_int(name: str, default: int) -> int:
         logger.warning("%s=%r is not an integer; using default %s", name, raw, default)
         return default
 
+
+def _derive_chat_title_from_text(value: Any) -> str:
+    text = " ".join(str(value or "").strip().split())
+    return text[:60] if text else ""
+
 # Cron output reaches `BasePlatformAdapter.send()` wrapped in this envelope
 # (built by `cron/scheduler.py` around line 503; controlled by the
 # `cron.wrap_response` config key, on by default). We strip it before
@@ -613,6 +618,8 @@ def make_adapter_class():
             if active and active.get("turn_id") == turn_id:
                 self._active_turns_by_chat.pop(chat_id, None)
             self._promote_local_queued_event(event)
+            if status == "completed":
+                asyncio.create_task(self._sync_chat_title_from_hermes_later(chat_id, event.source))
 
         async def send_exec_approval(
             self,
@@ -1298,6 +1305,33 @@ def make_adapter_class():
                     "accepted": True,
                 })
                 return
+            if action == "chat.rename":
+                title = str(frame.get("title") or frame.get("chat_name") or frame.get("text") or "").strip()
+                if not title:
+                    await self._send_chat_action_error(frame, "CHAT_RENAME_INVALID", "title is required")
+                    return
+                try:
+                    if hasattr(self._chat_event_logs, "rename_chat"):
+                        event = await asyncio.to_thread(self._chat_event_logs.rename_chat, chat_id, title)
+                        title = str(event.payload.get("title") or title)
+                    else:
+                        await self._append_chat_event_async(chat_id, "chat.renamed", {
+                            "chat_id": chat_id,
+                            "title": title,
+                            "renamed_at": _utc_iso(),
+                        })
+                    await self._sync_hermes_session_title(frame, chat_id, title)
+                except Exception as exc:  # noqa: BLE001
+                    await self._send_chat_action_error(frame, _chat_state_error_code(exc), str(exc))
+                    return
+                await self._send_frame({
+                    "type": FRAME_CHAT_ACTION_ACK,
+                    "request_id": request_id,
+                    "chat_id": chat_id,
+                    "accepted": True,
+                    "title": title,
+                })
+                return
             if action == "session.status":
                 source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
                 try:
@@ -1927,6 +1961,76 @@ def make_adapter_class():
                 group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
                 thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             )
+
+        async def _sync_hermes_session_title(self, frame: dict[str, Any], chat_id: str, title: str) -> None:
+            source = self._source_for_chat_action(frame, chat_id) or self._source_for_chat(chat_id)
+            if source is None:
+                return
+
+            def sync() -> None:
+                session_store = getattr(self, "_session_store", None)
+                if session_store is None:
+                    return
+                db = getattr(session_store, "_db", None) or getattr(self, "_session_db", None)
+                if db is None:
+                    return
+                session_entry = session_store.get_or_create_session(source)
+                clean_title = title
+                sanitizer = getattr(db, "sanitize_title", None)
+                if callable(sanitizer):
+                    clean_title = sanitizer(title)
+                if clean_title:
+                    db.set_session_title(session_entry.session_id, clean_title)
+
+            try:
+                await asyncio.to_thread(sync)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to sync Vylen chat title to Hermes session: %s", type(exc).__name__)
+
+        async def _sync_chat_title_from_hermes_later(self, chat_id: str, source: Any) -> None:
+            await asyncio.sleep(0.5)
+
+            def read_title() -> str:
+                session_store = getattr(self, "_session_store", None)
+                if session_store is None:
+                    return ""
+                db = getattr(session_store, "_db", None) or getattr(self, "_session_db", None)
+                if db is None or not hasattr(db, "get_session_title"):
+                    return ""
+                session_entry = session_store.get_or_create_session(source)
+                return str(db.get_session_title(session_entry.session_id) or "").strip()
+
+            try:
+                title = await asyncio.to_thread(read_title)
+                if not title or not hasattr(self._chat_event_logs, "get_chat"):
+                    return
+                chat = await asyncio.to_thread(self._chat_event_logs.get_chat, chat_id)
+                if chat is None or str(chat.title or "").strip() == title:
+                    return
+                allowed_titles = {"", "New conversation", _derive_chat_title_from_text(await self._first_user_message_text(chat_id))}
+                if str(chat.title or "").strip() not in allowed_titles:
+                    return
+                if hasattr(self._chat_event_logs, "rename_chat"):
+                    await asyncio.to_thread(self._chat_event_logs.rename_chat, chat_id, title)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to sync Hermes auto-title to Vylen chat: %s", exc)
+
+        async def _first_user_message_text(self, chat_id: str) -> str:
+            def read() -> str:
+                if not hasattr(self._chat_event_logs, "replay_after"):
+                    return ""
+                for event in self._chat_event_logs.replay_after(chat_id, 0, limit=50):
+                    if event.kind != "message.created":
+                        continue
+                    payload = event.payload if isinstance(event.payload, dict) else {}
+                    if str(payload.get("role") or "") == "user":
+                        return str(payload.get("text") or "")
+                return ""
+
+            try:
+                return await asyncio.to_thread(read)
+            except Exception:
+                return ""
 
         async def _append_session_status(self, chat_id: str, *, source: Any | None = None) -> None:
             active = self._active_turns_by_chat.get(chat_id)

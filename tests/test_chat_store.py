@@ -144,6 +144,41 @@ def test_chat_list_search_escapes_sqlite_wildcards(tmp_path):
     assert [chat.chat_id for chat in page.chats] == ["chat_literal"]
 
 
+def test_first_user_message_derives_plugin_title(tmp_path):
+    store = ChatStateStore(tmp_path / "chat-state.sqlite3")
+
+    store.append_event(
+        "chat_a",
+        "message.created",
+        {"role": "user", "text": "Create a deploy checklist for Friday", "chat_name": "New conversation"},
+        now=1000,
+    )
+
+    assert store.get_chat("chat_a").title == "Create a deploy checklist for Friday"
+
+
+def test_rename_chat_persists_and_emits_retained_event(tmp_path):
+    store = ChatStateStore(tmp_path / "chat-state.sqlite3")
+    store.append_event("chat_a", "message.created", {"text": "hello", "role": "user"}, now=1000)
+
+    event = store.rename_chat("chat_a", "Launch plan", now=1001)
+
+    assert event.kind == "chat.renamed"
+    assert event.payload["title"] == "Launch plan"
+    assert store.get_chat("chat_a").title == "Launch plan"
+    assert store.list_chats(query="launch").chats[0].chat_id == "chat_a"
+    assert [event.kind for event in store.replay_after("chat_a", 0)] == ["message.created", "chat.renamed"]
+
+
+def test_rename_chat_rejects_empty_title(tmp_path):
+    store = ChatStateStore(tmp_path / "chat-state.sqlite3")
+
+    with pytest.raises(InvalidChatStateEvent) as exc:
+        store.rename_chat("chat_a", "  ")
+
+    assert exc.value.code == "invalid_title"
+
+
 def test_chat_list_excludes_plugin_inbox(tmp_path):
     store = ChatStateStore(tmp_path / "chat-state.sqlite3")
     store.append_event("inbox", "push", {"text": "cron"})

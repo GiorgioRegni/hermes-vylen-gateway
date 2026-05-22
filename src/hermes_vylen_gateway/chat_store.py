@@ -373,7 +373,7 @@ class ChatStateStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT latest_seq FROM chats WHERE chat_id = ?",
+                    "SELECT latest_seq, title FROM chats WHERE chat_id = ?",
                     (clean_chat_id,),
                 ).fetchone()
                 if row is None:
@@ -387,7 +387,7 @@ class ChatStateStore:
                         """,
                         (
                             clean_chat_id,
-                            _clean_title(title or payload.get("chat_name") or "New conversation"),
+                            _initial_title_for_event(kind, payload, title),
                             _optional_id(creator_client_id),
                             _optional_id(creator_user_id),
                             iso,
@@ -395,8 +395,10 @@ class ChatStateStore:
                         ),
                     )
                     latest_seq = 0
+                    next_title = None
                 else:
                     latest_seq = int(row["latest_seq"])
+                    next_title = _replacement_title_for_event(kind, payload, str(row["title"] or ""))
                 seq = latest_seq + 1
                 conn.execute(
                     """
@@ -406,23 +408,44 @@ class ChatStateStore:
                     (clean_chat_id, seq, kind, payload_json, size_bytes, iso, iso),
                 )
                 if preview is None:
-                    conn.execute(
-                        "UPDATE chats SET latest_seq = ?, updated_at = ? WHERE chat_id = ?",
-                        (seq, iso, clean_chat_id),
-                    )
+                    if next_title is None:
+                        conn.execute(
+                            "UPDATE chats SET latest_seq = ?, updated_at = ? WHERE chat_id = ?",
+                            (seq, iso, clean_chat_id),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE chats SET latest_seq = ?, updated_at = ?, title = ? WHERE chat_id = ?",
+                            (seq, iso, next_title, clean_chat_id),
+                        )
                 else:
-                    conn.execute(
-                        """
-                        UPDATE chats SET
-                          latest_seq = ?,
-                          updated_at = ?,
-                          last_message_preview = ?,
-                          last_message_role = ?,
-                          last_message_at = ?
-                        WHERE chat_id = ?
-                        """,
-                        (seq, iso, preview[0], preview[1], preview[2], clean_chat_id),
-                    )
+                    if next_title is None:
+                        conn.execute(
+                            """
+                            UPDATE chats SET
+                              latest_seq = ?,
+                              updated_at = ?,
+                              last_message_preview = ?,
+                              last_message_role = ?,
+                              last_message_at = ?
+                            WHERE chat_id = ?
+                            """,
+                            (seq, iso, preview[0], preview[1], preview[2], clean_chat_id),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE chats SET
+                              latest_seq = ?,
+                              updated_at = ?,
+                              title = ?,
+                              last_message_preview = ?,
+                              last_message_role = ?,
+                              last_message_at = ?
+                            WHERE chat_id = ?
+                            """,
+                            (seq, iso, next_title, preview[0], preview[1], preview[2], clean_chat_id),
+                        )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -439,6 +462,69 @@ class ChatStateStore:
                 self._sweep_requested = True
         self.get_or_create(clean_chat_id)._bump()
         return RetainedEvent(seq=seq, kind=kind, payload=dict(payload), created_at=ts, size_bytes=size_bytes)
+
+    def rename_chat(self, chat_id: str, title: str, *, now: float | None = None) -> RetainedEvent:
+        self._raise_if_unavailable()
+        clean_chat_id = _clean_id(chat_id)
+        if not clean_chat_id:
+            raise InvalidChatStateEvent("invalid_chat_id", "chat_id is invalid")
+        if not str(title or "").strip():
+            raise InvalidChatStateEvent("invalid_title", "title is required")
+        clean_title = _clean_title(title)
+        ts = float(self._now() if now is None else now)
+        iso = _iso_from_epoch(ts)
+        payload = {"chat_id": clean_chat_id, "title": clean_title, "renamed_at": iso}
+        payload_json = _canonical_json(payload)
+        size_bytes = len("chat.renamed".encode("utf-8")) + len(payload_json.encode("utf-8"))
+        if size_bytes > self.config.max_event_bytes:
+            raise EventTooLarge(size_bytes, self.config.max_event_bytes)
+        with self._lock:
+            conn = self._conn_or_raise()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT latest_seq FROM chats WHERE chat_id = ?",
+                    (clean_chat_id,),
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO chats(chat_id, title, kind, created_at, updated_at, latest_seq, floor_seq)
+                        VALUES (?, ?, 'chat', ?, ?, 0, 0)
+                        """,
+                        (clean_chat_id, clean_title, iso, iso),
+                    )
+                    latest_seq = 0
+                else:
+                    latest_seq = int(row["latest_seq"])
+                seq = latest_seq + 1
+                conn.execute(
+                    """
+                    INSERT INTO chat_events(chat_id, seq, kind, payload_json, payload_bytes, occurred_at, created_at)
+                    VALUES (?, ?, 'chat.renamed', ?, ?, ?, ?)
+                    """,
+                    (clean_chat_id, seq, payload_json, size_bytes, iso, iso),
+                )
+                conn.execute(
+                    "UPDATE chats SET title = ?, updated_at = ?, latest_seq = ? WHERE chat_id = ?",
+                    (clean_title, iso, seq, clean_chat_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            self._appends_since_sweep += 1
+            self._bytes_since_sweep += size_bytes
+            if (
+                self.config.gc_append_interval > 0
+                and self._appends_since_sweep >= self.config.gc_append_interval
+            ) or (
+                self.config.gc_bytes_interval > 0
+                and self._bytes_since_sweep >= self.config.gc_bytes_interval
+            ):
+                self._sweep_requested = True
+        self.get_or_create(clean_chat_id)._bump()
+        return RetainedEvent(seq=seq, kind="chat.renamed", payload=payload, created_at=ts, size_bytes=size_bytes)
 
     def ensure_fits(self, kind: str, payload: dict[str, Any]) -> int:
         payload_json = _canonical_json(payload)
@@ -1067,7 +1153,35 @@ def _optional_id(value: str | None) -> str | None:
 
 def _clean_title(value: Any) -> str:
     text = str(value or "").strip() or "New conversation"
-    return text[:200]
+    return text[:100]
+
+
+def _derive_title_from_message_text(value: Any) -> str:
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        return ""
+    return text[:60]
+
+
+def _title_is_default(value: str) -> bool:
+    return not str(value or "").strip() or str(value or "").strip() == "New conversation"
+
+
+def _initial_title_for_event(kind: str, payload: dict[str, Any], title: Any) -> str:
+    explicit = _clean_title(title or payload.get("chat_name") or "")
+    if not _title_is_default(explicit):
+        return explicit
+    derived = _replacement_title_for_event(kind, payload, explicit)
+    return derived or explicit
+
+
+def _replacement_title_for_event(kind: str, payload: dict[str, Any], current_title: str) -> str | None:
+    if not _title_is_default(current_title):
+        return None
+    if kind != "message.created" or str(payload.get("role") or "") != "user":
+        return None
+    derived = _derive_title_from_message_text(payload.get("text"))
+    return _clean_title(derived) if derived else None
 
 
 def _clean_search_query(value: Any) -> str:
