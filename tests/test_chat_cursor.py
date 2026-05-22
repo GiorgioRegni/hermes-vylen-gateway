@@ -294,11 +294,18 @@ async def test_chat_list_and_snapshot_frames_read_sqlite_store(tmp_path):
         "role": "user",
         "text": "hello",
     })
+    relay.append_event("chat_b", "message.created", {
+        "message_id": "msg_2",
+        "role": "user",
+        "text": "hello",
+        "chat_name": "Search target",
+    })
 
     await relay.handle_list({
         "type": "chat_list",
         "request_id": "req_list",
         "limit": 50,
+        "q": "target",
         "include_preview": False,
     })
     await relay.handle_snapshot({
@@ -310,7 +317,8 @@ async def test_chat_list_and_snapshot_frames_read_sqlite_store(tmp_path):
     })
 
     list_response = next(frame for frame in sent if frame["type"] == FRAME_CHAT_LIST_RESPONSE)
-    assert list_response["chats"][0]["chat_id"] == "chat_a"
+    assert list_response["chats"][0]["chat_id"] == "chat_b"
+    assert len(list_response["chats"]) == 1
     assert "preview" not in list_response["chats"][0]
 
     snapshot_response = next(frame for frame in sent if frame["type"] == FRAME_CHAT_SNAPSHOT_RESPONSE)

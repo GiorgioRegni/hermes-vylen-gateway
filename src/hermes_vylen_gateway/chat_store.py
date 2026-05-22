@@ -484,15 +484,20 @@ class ChatStateStore:
         limit: int = 50,
         before_updated_at: str | None = None,
         before_chat_id: str | None = None,
+        query: str | None = None,
         include_deleted: bool = False,
     ) -> ChatListPage:
         self._raise_if_unavailable()
         safe_limit = min(max(1, int(limit)), 200)
         where = []
         params: list[Any] = []
+        clean_query = _clean_search_query(query or "")
         if not include_deleted:
             where.append("deleted_at IS NULL")
             where.append("chat_id != 'inbox'")
+        if clean_query:
+            where.append("lower(title) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(clean_query.lower())}%")
         clean_before_chat_id = _clean_id(before_chat_id or "")
         if before_updated_at and clean_before_chat_id:
             where.append("(updated_at < ? OR (updated_at = ? AND chat_id < ?))")
@@ -1063,6 +1068,14 @@ def _optional_id(value: str | None) -> str | None:
 def _clean_title(value: Any) -> str:
     text = str(value or "").strip() or "New conversation"
     return text[:200]
+
+
+def _clean_search_query(value: Any) -> str:
+    return str(value or "").strip()[:128]
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _canonical_json(value: Any) -> str:

@@ -114,6 +114,36 @@ def test_chat_list_keyset_pagination_keeps_same_timestamp_rows(tmp_path):
     assert [chat.chat_id for chat in second.chats] == ["chat_a"]
 
 
+def test_chat_list_searches_titles_with_keyset_pagination(tmp_path):
+    store = ChatStateStore(tmp_path / "chat-state.sqlite3")
+    store.append_event("chat_a", "message.created", {"text": "alpha"}, title="Deploy checklist", now=1000)
+    store.append_event("chat_b", "message.created", {"text": "beta"}, title="deploy notes", now=1001)
+    store.append_event("chat_c", "message.created", {"text": "deploy in content only"}, title="Unrelated", now=1002)
+
+    first = store.list_chats(limit=1, query="DEPLOY")
+    second = store.list_chats(
+        limit=1,
+        query="deploy",
+        before_updated_at=first.chats[-1].updated_at,
+        before_chat_id=first.chats[-1].chat_id,
+    )
+
+    assert [chat.chat_id for chat in first.chats] == ["chat_b"]
+    assert first.has_more is True
+    assert [chat.chat_id for chat in second.chats] == ["chat_a"]
+    assert second.has_more is False
+
+
+def test_chat_list_search_escapes_sqlite_wildcards(tmp_path):
+    store = ChatStateStore(tmp_path / "chat-state.sqlite3")
+    store.append_event("chat_literal", "message.created", {"text": "one"}, title="100%_literal", now=1000)
+    store.append_event("chat_other", "message.created", {"text": "two"}, title="100xxliteral", now=1001)
+
+    page = store.list_chats(limit=10, query="%_")
+
+    assert [chat.chat_id for chat in page.chats] == ["chat_literal"]
+
+
 def test_chat_list_excludes_plugin_inbox(tmp_path):
     store = ChatStateStore(tmp_path / "chat-state.sqlite3")
     store.append_event("inbox", "push", {"text": "cron"})

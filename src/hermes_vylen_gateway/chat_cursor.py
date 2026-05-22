@@ -132,6 +132,7 @@ class ChatCursorRelay:
                 limit=_parse_limit(frame.get("limit"), default=50, maximum=200),
                 before_updated_at=str(frame.get("before_updated_at") or "") or None,
                 before_chat_id=str(frame.get("before_chat_id") or "") or None,
+                query=_clean_search_query(frame.get("q") or frame.get("query") or ""),
             )
             include_preview = bool(frame.get("include_preview"))
             await self._send({
@@ -305,6 +306,10 @@ def _parse_limit(value: Any, *, default: int, maximum: int) -> int:
         return min(max(1, int(value)), maximum)
     except (TypeError, ValueError):
         return default
+
+
+def _clean_search_query(value: Any) -> str:
+    return str(value or "").strip()[:128]
 
 
 def _event_id() -> str:
