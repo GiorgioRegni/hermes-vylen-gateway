@@ -85,12 +85,9 @@ class HealthReporter:
                 if status_text:
                     frame["chat_state_status"] = status_text
                 if message:
-                    frame["chat_state_message"] = str(message)
-                quarantined_path = getattr(chat_status, "quarantined_path", None)
-                if quarantined_path:
-                    frame["chat_state_quarantined_path"] = str(quarantined_path)
+                    frame["chat_state_message"] = _sanitize_chat_state_message(status_text)
                 if status_text and status_text not in {"ok", "initializing"} and last_error is None:
-                    frame["last_error"] = f"chat_state: {message or status_text}"
+                    frame["last_error"] = f"chat_state: {status_text}"
             except Exception:  # noqa: BLE001
                 logger.debug("chat state status probe failed", exc_info=True)
         try:
@@ -105,6 +102,16 @@ class HealthReporter:
         if ok:
             return "ok", elapsed_ms, None
         return "unreachable", elapsed_ms, error
+
+
+def _sanitize_chat_state_message(status: str) -> str:
+    if status == "reset_after_corruption":
+        return "Local Vylen chat state was reset after SQLite corruption."
+    if status == "version_mismatch":
+        return "Local Vylen chat state schema is newer than this plugin supports."
+    if status == "open_failed":
+        return "Local Vylen chat state is unavailable."
+    return str(status or "chat_state_unavailable")
 
 
 def _interval_from_env() -> float:

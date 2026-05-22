@@ -2015,7 +2015,11 @@ async def test_chat_message_reports_chat_state_unavailable(adapter):
 
 
 @pytest.mark.asyncio
-async def test_chat_delete_action_appends_tombstone(adapter):
+async def test_chat_delete_action_appends_tombstone(adapter, monkeypatch):
+    async def immediate_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "to_thread", immediate_to_thread)
     await adapter._append_chat_event_async("chat_a", "message.created", {"text": "hello"})
 
     await adapter._handle_chat_action({
@@ -2060,3 +2064,48 @@ async def test_chat_rename_action_persists_event_and_syncs_hermes_title(adapter,
     assert adapter._chat_event_logs.get_chat("chat_a").title == "Launch   plan"
     assert adapter._chat_event_logs.replay_after("chat_a", 0)[-1].kind == "chat.renamed"
     assert db.titles == [("session_chat_a_user_1", "Launch plan")]
+
+
+@pytest.mark.asyncio
+async def test_native_title_message_persists_rename_without_user_echo(adapter, monkeypatch):
+    async def immediate_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "to_thread", immediate_to_thread)
+
+    await adapter._handle_chat_message(_chat_message_frame(
+        request_id="title_req",
+        client_message_id="client_title_1",
+        text="/title Mobile plan",
+    ))
+
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_ack"]
+    assert acks[-1]["request_id"] == "title_req"
+    assert adapter._chat_event_logs.get_chat("chat_a").title == "Mobile plan"
+    events = adapter._chat_event_logs.replay_after("chat_a", 0)
+    assert [event.kind for event in events] == ["chat.renamed"]
+
+
+@pytest.mark.asyncio
+async def test_append_threshold_sweep_schedules_from_event_loop(adapter):
+    class SweepRegistry:
+        def __init__(self) -> None:
+            self.consumed = 0
+            self.swept = 0
+
+        def consume_sweep_requested(self) -> bool:
+            self.consumed += 1
+            return True
+
+        def sweep(self) -> int:
+            self.swept += 1
+            return 0
+
+    registry = SweepRegistry()
+    adapter._chat_event_logs = registry
+
+    adapter._maybe_schedule_chat_state_sweep()
+    await adapter._chat_sweep_request_task
+
+    assert registry.consumed == 1
+    assert registry.swept == 1

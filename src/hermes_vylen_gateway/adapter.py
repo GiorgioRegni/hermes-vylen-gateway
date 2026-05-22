@@ -1022,6 +1022,32 @@ def make_adapter_class():
                     await self._chat_dedup_forget_async(chat_id, client_message_id)
                     await self._send_chat_message_error(frame, _chat_state_error_code(exc), str(exc))
                     return
+            elif command == "title":
+                title = args.strip()
+                if not title:
+                    await self._chat_dedup_forget_async(chat_id, client_message_id)
+                    await self._send_chat_message_error(frame, "CHAT_RENAME_INVALID", "title is required")
+                    return
+                try:
+                    await self._chat_dedup_record_async(chat_id, client_message_id, accepted)
+                    if hasattr(self._chat_event_logs, "rename_chat"):
+                        event = await asyncio.to_thread(self._chat_event_logs.rename_chat, chat_id, title)
+                        self._maybe_schedule_chat_state_sweep()
+                        title = str(event.payload.get("title") or title)
+                    else:
+                        await self._append_chat_event_async(chat_id, "chat.renamed", {
+                            "chat_id": chat_id,
+                            "title": title,
+                            "renamed_at": _utc_iso(),
+                        })
+                    title_frame = dict(frame)
+                    title_frame["title"] = title
+                    title_frame["chat_name"] = title
+                    await self._sync_hermes_session_title(title_frame, chat_id, title)
+                except Exception as exc:  # noqa: BLE001
+                    await self._chat_dedup_forget_async(chat_id, client_message_id)
+                    await self._send_chat_message_error(frame, _chat_state_error_code(exc), str(exc))
+                    return
             elif command == "queue":
                 await self._chat_dedup_forget_async(chat_id, client_message_id)
                 frame = dict(frame)
@@ -1290,6 +1316,7 @@ def make_adapter_class():
                 try:
                     if hasattr(self._chat_event_logs, "mark_deleted"):
                         await asyncio.to_thread(self._chat_event_logs.mark_deleted, chat_id)
+                        self._maybe_schedule_chat_state_sweep()
                     else:
                         await self._append_chat_event_async(chat_id, "chat.deleted", {
                             "chat_id": chat_id,
@@ -1313,6 +1340,7 @@ def make_adapter_class():
                 try:
                     if hasattr(self._chat_event_logs, "rename_chat"):
                         event = await asyncio.to_thread(self._chat_event_logs.rename_chat, chat_id, title)
+                        self._maybe_schedule_chat_state_sweep()
                         title = str(event.payload.get("title") or title)
                     else:
                         await self._append_chat_event_async(chat_id, "chat.renamed", {
@@ -1710,14 +1738,14 @@ def make_adapter_class():
             if not hasattr(self._chat_event_logs, "consume_sweep_requested"):
                 return
             try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            try:
                 requested = self._chat_event_logs.consume_sweep_requested()
             except Exception:  # noqa: BLE001
                 return
             if not requested:
-                return
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
                 return
             if self._chat_sweep_request_task is not None and not self._chat_sweep_request_task.done():
                 return
@@ -2012,6 +2040,7 @@ def make_adapter_class():
                     return
                 if hasattr(self._chat_event_logs, "rename_chat"):
                     await asyncio.to_thread(self._chat_event_logs.rename_chat, chat_id, title)
+                    self._maybe_schedule_chat_state_sweep()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Failed to sync Hermes auto-title to Vylen chat: %s", exc)
 
@@ -2463,6 +2492,8 @@ def _native_chat_command(text: str) -> bool:
     command, args = _split_native_chat_command(text)
     if command in {"status", "reset"}:
         return not args
+    if command == "title":
+        return bool(args.strip())
     return command in {"queue", "steer"}
 
 
