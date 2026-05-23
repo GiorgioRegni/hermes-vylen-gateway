@@ -119,12 +119,22 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-async def _rank_gateway_configs(configs: list[GatewayConfig]) -> list[GatewayConfig]:
+async def _rank_gateway_configs(
+    configs: list[GatewayConfig],
+    deprioritize_cloud_url: str | None = None,
+) -> list[GatewayConfig]:
     if len(configs) <= 1:
         return configs
     probes = await asyncio.gather(*(_relay_latency(cfg) for cfg in configs))
     indexed = list(enumerate(zip(configs, probes)))
-    indexed.sort(key=lambda item: (item[1][1] is None, item[1][1] or float("inf"), item[0]))
+    indexed.sort(
+        key=lambda item: (
+            item[1][1] is None,
+            item[1][0].cloud_url == deprioritize_cloud_url,
+            item[1][1] or float("inf"),
+            item[0],
+        )
+    )
     return [cfg for _, (cfg, _) in indexed]
 
 
@@ -250,6 +260,8 @@ def make_adapter_class():
             self._chat_sweep_task: asyncio.Task | None = None
             self._chat_sweep_request_task: asyncio.Task | None = None
             self._relay_generation_task: asyncio.Task | None = None
+            self._connected_gateway_cfg: GatewayConfig | None = None
+            self._deprioritize_cloud_url_once: str | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
@@ -323,9 +335,15 @@ def make_adapter_class():
                     await self._client.iter_frames(on_frame)
                 except Exception as exc:  # noqa: BLE001
                     logger.info("Vylen gateway socket dropped: %s", exc)
+                dropped_cloud_url = (
+                    self._connected_gateway_cfg.cloud_url
+                    if self._connected_gateway_cfg is not None
+                    else None
+                )
                 await self._teardown_session()
                 if self._stopping:
                     return
+                self._deprioritize_cloud_url_once = dropped_cloud_url
                 logger.info("Vylen gateway reconnecting in %.1fs", backoff)
                 await asyncio.sleep(backoff)
 
@@ -335,7 +353,9 @@ def make_adapter_class():
             except ConfigError as exc:
                 logger.error("Vylen gateway config invalid: %s", exc)
                 return False
-            ranked = await _rank_gateway_configs(gateway_cfgs)
+            deprioritize = self._deprioritize_cloud_url_once
+            self._deprioritize_cloud_url_once = None
+            ranked = await _rank_gateway_configs(gateway_cfgs, deprioritize_cloud_url=deprioritize)
             client: VylenGatewayClient | None = None
             ready: ReadyInfo | None = None
             gateway_cfg: GatewayConfig | None = None
@@ -353,6 +373,7 @@ def make_adapter_class():
             if client is None or ready is None or gateway_cfg is None:
                 return False
             self._client = client
+            self._connected_gateway_cfg = gateway_cfg
             self._instance_id = ready.instance_id
             if hasattr(self._chat_event_logs, "set_event_loop"):
                 self._chat_event_logs.set_event_loop(asyncio.get_running_loop())
@@ -451,6 +472,7 @@ def make_adapter_class():
             if self._client:
                 await self._client.close()
                 self._client = None
+            self._connected_gateway_cfg = None
 
         async def _watch_relay_generation(
             self,

@@ -69,3 +69,32 @@ async def test_rank_gateway_configs_orders_by_latency_and_keeps_down_relays_last
         "https://slow.example.test",
         "https://down.example.test",
     ]
+
+
+@pytest.mark.asyncio
+async def test_rank_gateway_configs_deprioritizes_recently_dropped_relay(monkeypatch):
+    configs = [
+        GatewayConfig("token", "https://dropped.example.test", "wss://dropped.example.test/v1/gateway"),
+        GatewayConfig("token", "https://backup.example.test", "wss://backup.example.test/v1/gateway"),
+        GatewayConfig("token", "https://down.example.test", "wss://down.example.test/v1/gateway"),
+    ]
+
+    async def fake_latency(config: GatewayConfig) -> float | None:
+        return {
+            "https://dropped.example.test": 0.01,
+            "https://backup.example.test": 0.2,
+            "https://down.example.test": None,
+        }[config.cloud_url]
+
+    monkeypatch.setattr(adapter, "_relay_latency", fake_latency)
+
+    ranked = await adapter._rank_gateway_configs(
+        configs,
+        deprioritize_cloud_url="https://dropped.example.test",
+    )
+
+    assert [cfg.cloud_url for cfg in ranked] == [
+        "https://backup.example.test",
+        "https://dropped.example.test",
+        "https://down.example.test",
+    ]
