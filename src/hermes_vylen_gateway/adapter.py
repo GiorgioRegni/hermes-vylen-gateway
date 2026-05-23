@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import inspect
 import json
 import mimetypes
 import logging
@@ -22,6 +23,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from .blobs import BlobRegistry
@@ -58,7 +60,7 @@ VYLEN_ALLOWED_USERS_ENV = "VYLEN_ALLOWED_USERS"
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
 _CHAT_INDEX_EVENT_KINDS = {"message.created", "chat.renamed", "chat.deleted", "push"}
 _TOOL_PROGRESS_LINE_RE = re.compile(
-    r"^(?P<emoji>\S+)\s+(?P<tool>[A-Za-z_][A-Za-z0-9_.-]*)(?:(?P<ellipsis>\.\.\.)|:\s*(?P<label>.*))$"
+    r"^(?P<emoji>[^\x00-\x7F\s]+)\s+(?P<tool>[A-Za-z_][A-Za-z0-9_.-]*)(?:(?P<ellipsis>\.\.\.)|:\s*(?P<label>.*))$"
 )
 _DEDUP_SUFFIX_RE = re.compile(r"\s+\(×\d+\)$")
 
@@ -264,7 +266,135 @@ def make_adapter_class():
             self._relay_generation_task: asyncio.Task | None = None
             self._connected_gateway_cfg: GatewayConfig | None = None
             self._deprioritize_cloud_url_once: str | None = None
+            self._hermes_message_handler_owner: Any | None = None
+            self._queued_events_by_message_id: dict[str, Any] = {}
             self._stopping = False
+
+        def set_message_handler(self, handler) -> None:
+            self._hermes_message_handler_owner = getattr(handler, "__self__", None)
+            self._install_runner_turn_lifecycle_wrapper(self._hermes_message_handler_owner)
+
+            async def wrapped_handler(event, *args, **kwargs):
+                restore_interactive_fallbacks = self._suppress_card_prompt_text_fallbacks(event)
+                try:
+                    result = handler(event, *args, **kwargs)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+                finally:
+                    restore_interactive_fallbacks()
+
+            return super().set_message_handler(wrapped_handler)
+
+        def _install_runner_turn_lifecycle_wrapper(self, runner: Any | None) -> None:
+            if runner is None:
+                return
+            setattr(runner, "_vylen_turn_lifecycle_adapter", self)
+            if getattr(runner, "_vylen_turn_lifecycle_wrapped", False):
+                return
+            run_agent = getattr(runner, "_run_agent", None)
+            if not callable(run_agent):
+                return
+
+            async def wrapped_run_agent(*args, **kwargs):
+                adapter = getattr(runner, "_vylen_turn_lifecycle_adapter", self)
+                event_message_id = str(kwargs.get("event_message_id") or "")
+                queued_event = adapter._queued_events_by_message_id.pop(event_message_id, None)
+                if queued_event is None:
+                    result = run_agent(*args, **kwargs)
+                    return await result if inspect.isawaitable(result) else result
+
+                chat_id = str(getattr(getattr(queued_event, "source", None), "chat_id", "") or "")
+                previous_active = adapter._active_turns_by_chat.get(chat_id) if chat_id else None
+                try:
+                    await adapter._start_runner_drained_queued_turn(queued_event)
+                    result = run_agent(*args, **kwargs)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    await adapter._complete_runner_drained_queued_turn(queued_event, "completed")
+                    return result
+                except Exception:
+                    await adapter._complete_runner_drained_queued_turn(queued_event, "failed")
+                    raise
+                finally:
+                    if chat_id and previous_active is not None and previous_active.get("turn_id") != _event_turn_id(queued_event):
+                        adapter._active_turns_by_chat[chat_id] = previous_active
+
+            setattr(runner, "_run_agent", wrapped_run_agent)
+            setattr(runner, "_vylen_turn_lifecycle_wrapped", True)
+
+        async def _start_runner_drained_queued_turn(self, event: Any) -> None:
+            turn_id = _event_turn_id(event)
+            if not turn_id:
+                return
+            chat_id = str(event.source.chat_id)
+            user_message_id = str(getattr(event, "message_id", "") or "")
+            active = self._active_turn_for_event(event)
+            self._active_turns_by_chat[chat_id] = active
+            task = asyncio.current_task()
+            if task is not None:
+                self._turns_by_task[task] = {"chat_id": chat_id, **active}
+            await self._append_chat_event_async(chat_id, "turn.started", {
+                "turn_id": turn_id,
+                "message_id": user_message_id,
+                "started_at": _utc_iso(),
+            })
+            if user_message_id:
+                await self._append_chat_event_async(chat_id, "message.updated", {
+                    "message_id": user_message_id,
+                    "turn_id": turn_id,
+                    "status": "running",
+                    "updated_at": _utc_iso(),
+                })
+
+        async def _complete_runner_drained_queued_turn(self, event: Any, status: str) -> None:
+            turn_id = _event_turn_id(event)
+            if not turn_id:
+                return
+            chat_id = str(event.source.chat_id)
+            user_message_id = str(getattr(event, "message_id", "") or "")
+            task = asyncio.current_task()
+            if task is not None:
+                self._turns_by_task.pop(task, None)
+            event_kind = "turn.failed" if status == "failed" else "turn.completed"
+            payload = {
+                "turn_id": turn_id,
+                "message_id": user_message_id,
+                ("failed_at" if status == "failed" else "completed_at"): _utc_iso(),
+            }
+            if status == "failed":
+                payload["error"] = "message handler failed"
+            await self._append_chat_event_async(chat_id, event_kind, payload)
+            for activity_id in self._activity_ids_by_turn.pop(turn_id, set()):
+                if self._activity_status_by_id.get(activity_id) in {"completed", "failed"}:
+                    self._activity_payloads_by_id.pop(activity_id, None)
+                    self._activity_status_by_id.pop(activity_id, None)
+                    continue
+                await self._append_activity_terminal(
+                    chat_id,
+                    turn_id,
+                    activity_id,
+                    status="failed" if status == "failed" else "completed",
+                )
+                self._activity_payloads_by_id.pop(activity_id, None)
+                self._activity_status_by_id.pop(activity_id, None)
+            for assistant_message_id in self._assistant_messages_by_turn.pop(turn_id, set()):
+                await self._append_chat_event_async(chat_id, "message.updated", {
+                    "message_id": assistant_message_id,
+                    "turn_id": turn_id,
+                    "status": status,
+                    "updated_at": _utc_iso(),
+                })
+            if user_message_id:
+                await self._append_chat_event_async(chat_id, "message.updated", {
+                    "message_id": user_message_id,
+                    "turn_id": turn_id,
+                    "status": status,
+                    "updated_at": _utc_iso(),
+                })
+            active = self._active_turns_by_chat.get(chat_id)
+            if active and active.get("turn_id") == turn_id:
+                self._active_turns_by_chat.pop(chat_id, None)
 
         async def connect(self) -> bool:
             try:
@@ -634,6 +764,8 @@ def make_adapter_class():
                 return
             chat_id = str(event.source.chat_id)
             user_message_id = str(getattr(event, "message_id", "") or "")
+            if user_message_id:
+                self._queued_events_by_message_id.pop(user_message_id, None)
             active = self._active_turns_by_chat.get(chat_id)
             if active is None or active.get("turn_id") != turn_id:
                 active = self._active_turn_for_event(event)
@@ -793,6 +925,103 @@ def make_adapter_class():
                 },
                 message_prefix="confirm",
                 action_id=confirm_id,
+            )
+
+        async def send_clarify(
+            self,
+            chat_id: str,
+            question: str,
+            choices: Optional[list],
+            clarify_id: str,
+            session_key: str,
+            metadata: Optional[dict[str, Any]] = None,
+        ):
+            clean_choices = [str(choice) for choice in (choices or [])]
+            return await self._create_action_card(
+                chat_id=chat_id,
+                kind="input",
+                event_kind="input.requested",
+                session_key=session_key,
+                payload={
+                    "title": "Clarify",
+                    "message": str(question or ""),
+                    "choices": clean_choices,
+                    "input_mode": "choice" if clean_choices else "text",
+                    "placeholder": "Type your answer",
+                    "clarify_id": clarify_id,
+                },
+                message_prefix="input",
+                action_id=clarify_id,
+                record_extra={
+                    "input_kind": "clarify",
+                    "clarify_id": clarify_id,
+                    "choices": clean_choices,
+                    "input_mode": "choice" if clean_choices else "text",
+                },
+            )
+
+        async def send_update_prompt(
+            self,
+            chat_id: str,
+            prompt: str,
+            default: str = "",
+            session_key: str = "",
+            metadata: Optional[dict[str, Any]] = None,
+        ):
+            return await self._create_action_card(
+                chat_id=chat_id,
+                kind="input",
+                event_kind="input.requested",
+                session_key=session_key,
+                payload={
+                    "title": "Update needs your input",
+                    "message": str(prompt or ""),
+                    "choices": [
+                        {"id": "y", "label": "Yes"},
+                        {"id": "n", "label": "No", "destructive": True},
+                    ],
+                    "input_mode": "choice",
+                    "default": str(default or ""),
+                },
+                message_prefix="input",
+                record_extra={
+                    "input_kind": "update_prompt",
+                    "default": str(default or ""),
+                    "choices": ["y", "n"],
+                    "input_mode": "choice",
+                },
+            )
+
+        async def send_model_picker(
+            self,
+            chat_id: str,
+            providers: list,
+            current_model: str,
+            current_provider: str,
+            session_key: str,
+            on_model_selected,
+            metadata: Optional[dict[str, Any]] = None,
+        ):
+            safe_providers = _sanitize_model_providers(providers)
+            return await self._create_action_card(
+                chat_id=chat_id,
+                kind="input",
+                event_kind="input.requested",
+                session_key=session_key,
+                payload=self._model_picker_provider_payload(
+                    safe_providers,
+                    current_model=str(current_model or ""),
+                    current_provider=str(current_provider or ""),
+                ),
+                message_prefix="input",
+                record_extra={
+                    "input_kind": "model_picker",
+                    "providers": safe_providers,
+                    "current_model": str(current_model or ""),
+                    "current_provider": str(current_provider or ""),
+                    "on_model_selected": on_model_selected,
+                    "stage": "provider",
+                },
             )
 
         async def send_image_file(
@@ -1076,6 +1305,78 @@ def make_adapter_class():
                     "updated_at": _utc_iso(),
                 })
 
+        def _has_pending_input_card(self, session_key: str, input_kind: str) -> bool:
+            if not session_key:
+                return False
+            for record in self._action_cards.values():
+                if (
+                    record.get("kind") == "input"
+                    and record.get("input_kind") == input_kind
+                    and record.get("session_key") == session_key
+                ):
+                    return True
+            return False
+
+        def _clear_update_prompt_pending(self, session_key: str) -> None:
+            if not session_key:
+                return
+            for pending in self._update_prompt_pending_maps():
+                pending.pop(session_key, None)
+
+        def _update_prompt_pending_maps(self) -> list[dict[str, Any]]:
+            maps: list[dict[str, Any]] = []
+            seen: set[int] = set()
+            for owner in (self._hermes_message_handler_owner, self):
+                pending = getattr(owner, "_update_prompt_pending", None)
+                if isinstance(pending, dict) and id(pending) not in seen:
+                    maps.append(pending)
+                    seen.add(id(pending))
+            return maps
+
+        def _suppress_card_prompt_text_fallbacks(self, event: Any):
+            source = getattr(event, "source", None)
+            if source is None:
+                return lambda: None
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:  # noqa: BLE001
+                return lambda: None
+            if not session_key:
+                return lambda: None
+
+            suppressed_update_prompts: list[tuple[dict[str, Any], Any]] = []
+            if self._has_pending_input_card(session_key, "update_prompt"):
+                for pending_updates in self._update_prompt_pending_maps():
+                    if session_key in pending_updates:
+                        suppressed_update_prompts.append((pending_updates, pending_updates.pop(session_key)))
+
+            clarify_entry = None
+            clarify_was_awaiting_text = False
+            if self._has_pending_input_card(session_key, "clarify"):
+                try:
+                    from tools import clarify_gateway as _clarify_mod
+
+                    clarify_entry = _clarify_mod.get_pending_for_session(session_key)
+                except Exception:  # noqa: BLE001
+                    clarify_entry = None
+                if clarify_entry is not None:
+                    clarify_was_awaiting_text = bool(getattr(clarify_entry, "awaiting_text", False))
+                    clarify_entry.awaiting_text = False
+
+            def restore() -> None:
+                if self._has_pending_input_card(session_key, "update_prompt"):
+                    for pending_updates, update_prompt_value in suppressed_update_prompts:
+                        pending_updates[session_key] = update_prompt_value
+                if (
+                    clarify_entry is not None
+                    and clarify_was_awaiting_text
+                    and not getattr(getattr(clarify_entry, "event", None), "is_set", lambda: False)()
+                    and self._has_pending_input_card(session_key, "clarify")
+                ):
+                    clarify_entry.awaiting_text = True
+
+            return restore
+
         async def _handle_native_chat_command(
             self,
             *,
@@ -1105,6 +1406,16 @@ def make_adapter_class():
                 except Exception as exc:  # noqa: BLE001
                     await self._chat_dedup_forget_async(chat_id, client_message_id)
                     await self._send_chat_message_error(frame, _chat_state_error_code(exc, fallback="SESSION_STATUS_FAILED"), str(exc))
+                    return
+            elif command == "e2e-input" and _e2e_input_tests_enabled():
+                try:
+                    await self._chat_dedup_record_async(chat_id, client_message_id, accepted)
+                    if source is None:
+                        raise RuntimeError("Could not route E2E input prompt")
+                    await self._handle_e2e_input_command(chat_id, source, args)
+                except Exception as exc:  # noqa: BLE001
+                    await self._chat_dedup_forget_async(chat_id, client_message_id)
+                    await self._send_chat_message_error(frame, _chat_state_error_code(exc, fallback="E2E_INPUT_FAILED"), str(exc))
                     return
             elif command == "reset":
                 active = self._active_turns_by_chat.get(chat_id)
@@ -1205,6 +1516,93 @@ def make_adapter_class():
                 "turn_id": turn_id,
                 "accepted": True,
             })
+
+        async def _handle_e2e_input_command(self, chat_id: str, source: Any, args: str) -> None:
+            mode = (args or "").strip().split(" ", 1)[0]
+            session_key = self._session_key_for_source(source)
+            if mode in {"clarify", "clarify-choice"}:
+                from tools import clarify_gateway as _clarify_mod
+
+                clarify_id = f"e2e_clarify_{uuid.uuid4().hex}"
+                choice_mode = mode == "clarify-choice"
+                question = "Which E2E output style?"
+                choices = ["concise", "detailed", "checklist"] if choice_mode else None
+                if not choice_mode:
+                    question = "What token should I repeat?"
+                _clarify_mod.register(clarify_id, session_key, question, choices)
+                result = await self.send_clarify(
+                    chat_id=chat_id,
+                    question=question,
+                    choices=choices,
+                    clarify_id=clarify_id,
+                    session_key=session_key,
+                )
+                if not result.success:
+                    raise RuntimeError(result.error or "failed to send E2E clarify prompt")
+
+                action_record = self._action_cards.get(clarify_id) or {}
+                action_turn_id = str(action_record.get("turn_id") or "")
+
+                async def wait_and_echo() -> None:
+                    response = await asyncio.to_thread(_clarify_mod.wait_for_response, clarify_id, self._action_ttl_seconds)
+                    if action_record.get("cancelled") or (action_turn_id and action_turn_id in self._cancelled_turns):
+                        return
+                    await self._append_assistant_message(chat_id, f"E2E clarify answered: {response or ''}", None)
+
+                task = asyncio.create_task(wait_and_echo())
+                self._chat_message_tasks.add(task)
+                task.add_done_callback(self._chat_message_tasks.discard)
+                return
+
+            if mode == "update":
+                home = _hermes_home_for_update_response()
+                home.mkdir(parents=True, exist_ok=True)
+                (home / ".update_prompt.json").write_text(json.dumps({
+                    "prompt": "Apply E2E update?",
+                    "default": "y",
+                    "id": f"e2e_update_{uuid.uuid4().hex}",
+                }))
+                for pending_updates in self._update_prompt_pending_maps():
+                    pending_updates[session_key] = True
+                result = await self.send_update_prompt(
+                    chat_id=chat_id,
+                    prompt="Apply E2E update?",
+                    default="y",
+                    session_key=session_key,
+                )
+                if not result.success:
+                    raise RuntimeError(result.error or "failed to send E2E update prompt")
+                return
+
+            if mode == "model":
+                providers = [
+                    {"slug": "openai-e2e", "name": "OpenAI E2E", "models": ["gpt-e2e-small", "gpt-e2e-large"]},
+                    {"slug": "local-e2e", "name": "Local E2E", "models": ["local-e2e-mini"]},
+                ]
+
+                async def on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
+                    override_owner = self._hermes_message_handler_owner or self
+                    overrides = getattr(override_owner, "_session_model_overrides", None)
+                    if not isinstance(overrides, dict):
+                        overrides = {}
+                        setattr(override_owner, "_session_model_overrides", overrides)
+                    overrides[session_key] = {"model": model_id, "provider": provider_slug}
+                    await self._append_session_controls(chat_id, source=source)
+                    return f"Switched to {model_id}"
+
+                result = await self.send_model_picker(
+                    chat_id=chat_id,
+                    providers=providers,
+                    current_model="gpt-e2e-current",
+                    current_provider="openai-e2e",
+                    session_key=session_key,
+                    on_model_selected=on_model_selected,
+                )
+                if not result.success:
+                    raise RuntimeError(result.error or "failed to send E2E model picker")
+                return
+
+            raise ValueError("expected clarify, clarify-choice, update, or model")
 
         async def _handle_message_control_action(
             self,
@@ -1592,6 +1990,9 @@ def make_adapter_class():
                     ack_type=FRAME_CHAT_ACTION_ACK,
                 )
                 return
+            if action in {"input.respond", "input.cancel"}:
+                await self._handle_input_action(frame, chat_id, request_id, action_id, action)
+                return
             if action not in {"approval.respond", "confirm.respond"} or not action_id:
                 await self._send_chat_action_error(frame, "CHAT_ACTION_INVALID", "unsupported chat action")
                 return
@@ -1686,6 +2087,336 @@ def make_adapter_class():
             if expected_kind == "approval":
                 payload["resolved"] = choice != "deny"
             await self._append_chat_event_async(chat_id, resolved_kind, payload)
+            await self._send_frame({
+                "type": FRAME_CHAT_ACTION_ACK,
+                "request_id": request_id,
+                "chat_id": chat_id,
+                "action_id": action_id,
+                "accepted": True,
+            })
+
+        async def _handle_input_action(
+            self,
+            frame: dict[str, Any],
+            chat_id: str,
+            request_id: str,
+            action_id: str,
+            action: str,
+        ) -> None:
+            if not action_id:
+                await self._send_chat_action_error(frame, "CHAT_ACTION_INVALID", "action_id is required")
+                return
+            record = self._action_cards.get(action_id)
+            if record is None or record.get("chat_id") != chat_id or record.get("kind") != "input":
+                await self._send_chat_action_error(frame, "STALE_ACTION", "This action is no longer available")
+                return
+            if float(record.get("expires_at") or 0) <= time.time():
+                try:
+                    await self._expire_input_action(chat_id, action_id, record, reason="stale_action")
+                except Exception as exc:  # noqa: BLE001
+                    await self._send_chat_action_error(frame, "ACTION_RESOLVE_FAILED", str(exc))
+                    return
+                await self._send_chat_action_error(frame, "STALE_ACTION", "This action is no longer available")
+                return
+
+            input_kind = str(record.get("input_kind") or "")
+            if action == "input.cancel":
+                await self._cancel_input_action(frame, chat_id, request_id, action_id, record)
+                return
+
+            if input_kind == "model_picker":
+                await self._handle_model_picker_action(frame, chat_id, request_id, action_id, record)
+                return
+
+            choice = str(frame.get("choice") or "").strip()
+            text = str(frame.get("text") or "").strip()
+
+            try:
+                if input_kind == "clarify":
+                    valid, code, message = _validate_input_response(record, choice=choice, text=text)
+                    if not valid:
+                        await self._send_chat_action_error(frame, code, message)
+                        return
+                    response = text or choice
+                    if not response:
+                        await self._send_chat_action_error(frame, "INPUT_REQUIRED", "response is required")
+                        return
+                    from tools.clarify_gateway import resolve_gateway_clarify
+
+                    if not resolve_gateway_clarify(str(record.get("clarify_id") or action_id), response):
+                        await self._emit_action_expired(chat_id, action_id, "input", record, reason="resolver_lost")
+                        await self._send_chat_action_error(frame, "STALE_ACTION", "This prompt is no longer available")
+                        return
+                    payload = {
+                        "turn_id": record.get("turn_id"),
+                        "action_id": action_id,
+                        "message_id": record.get("message_id"),
+                        "choice": choice,
+                        "response_text": response,
+                        "updated_at": _utc_iso(),
+                    }
+                elif input_kind == "update_prompt":
+                    valid, code, message = _validate_input_response(record, choice=choice, text=text)
+                    if not valid:
+                        await self._send_chat_action_error(frame, code, message)
+                        return
+                    answer = _normalize_update_answer(text or choice, str(record.get("default") or ""))
+                    _write_update_response(answer)
+                    self._clear_update_prompt_pending(str(record.get("session_key") or ""))
+                    payload = {
+                        "turn_id": record.get("turn_id"),
+                        "action_id": action_id,
+                        "message_id": record.get("message_id"),
+                        "choice": answer,
+                        "response_text": answer,
+                        "updated_at": _utc_iso(),
+                    }
+                else:
+                    await self._send_chat_action_error(frame, "CHAT_ACTION_INVALID", "unsupported input action")
+                    return
+            except Exception as exc:  # noqa: BLE001
+                await self._send_chat_action_error(frame, "ACTION_RESOLVE_FAILED", str(exc))
+                return
+
+            self._action_cards.pop(action_id, None)
+            await self._append_chat_event_async(chat_id, "input.resolved", payload)
+            await self._send_frame({
+                "type": FRAME_CHAT_ACTION_ACK,
+                "request_id": request_id,
+                "chat_id": chat_id,
+                "action_id": action_id,
+                "accepted": True,
+            })
+
+        async def _cancel_input_action(
+            self,
+            frame: dict[str, Any],
+            chat_id: str,
+            request_id: str,
+            action_id: str,
+            record: dict[str, Any],
+        ) -> None:
+            input_kind = str(record.get("input_kind") or "")
+            response_text = ""
+            try:
+                if input_kind == "clarify":
+                    from tools.clarify_gateway import resolve_gateway_clarify
+
+                    record["cancelled"] = True
+                    turn_id = str(record.get("turn_id") or "")
+                    active = self._active_turns_by_chat.get(chat_id)
+                    if turn_id and (active is None or active.get("turn_id") == turn_id):
+                        await self._cancel_active_turn(
+                            chat_id,
+                            active or {"turn_id": turn_id, "message_id": str(record.get("message_id") or "")},
+                            reason="input_cancelled",
+                        )
+                    if not resolve_gateway_clarify(str(record.get("clarify_id") or action_id), ""):
+                        await self._emit_action_expired(chat_id, action_id, "input", record, reason="resolver_lost")
+                        await self._send_chat_action_error(frame, "STALE_ACTION", "This prompt is no longer available")
+                        return
+                elif input_kind == "update_prompt":
+                    response_text = "n"
+                    _write_update_response(response_text)
+                    self._clear_update_prompt_pending(str(record.get("session_key") or ""))
+                elif input_kind != "model_picker":
+                    await self._send_chat_action_error(frame, "CHAT_ACTION_INVALID", "unsupported input action")
+                    return
+            except Exception as exc:  # noqa: BLE001
+                await self._send_chat_action_error(frame, "ACTION_RESOLVE_FAILED", str(exc))
+                return
+
+            self._action_cards.pop(action_id, None)
+            payload = {
+                "turn_id": record.get("turn_id"),
+                "action_id": action_id,
+                "message_id": record.get("message_id"),
+                "response_text": response_text,
+                "updated_at": _utc_iso(),
+            }
+            await self._append_chat_event_async(chat_id, "input.cancelled", payload)
+            await self._send_frame({
+                "type": FRAME_CHAT_ACTION_ACK,
+                "request_id": request_id,
+                "chat_id": chat_id,
+                "action_id": action_id,
+                "accepted": True,
+            })
+
+        async def _expire_input_action(
+            self,
+            chat_id: str,
+            action_id: str,
+            record: dict[str, Any],
+            *,
+            reason: str,
+        ) -> None:
+            input_kind = str(record.get("input_kind") or "")
+            if input_kind == "clarify":
+                try:
+                    from tools.clarify_gateway import resolve_gateway_clarify
+
+                    resolve_gateway_clarify(str(record.get("clarify_id") or action_id), "")
+                except Exception:
+                    logger.debug("Failed to clear expired clarify input state", exc_info=True)
+            elif input_kind == "update_prompt":
+                response_text = "n"
+                _write_update_response(response_text)
+                self._clear_update_prompt_pending(str(record.get("session_key") or ""))
+                record["response_text"] = response_text
+            await self._emit_action_expired(chat_id, action_id, "input", record, reason=reason)
+
+        async def _handle_model_picker_action(
+            self,
+            frame: dict[str, Any],
+            chat_id: str,
+            request_id: str,
+            action_id: str,
+            record: dict[str, Any],
+        ) -> None:
+            choice = str(frame.get("choice") or "").strip()
+            if not choice:
+                await self._send_chat_action_error(frame, "INVALID_CHOICE", "Model picker requires a card selection")
+                return
+            if choice == "cancel":
+                await self._cancel_input_action(frame, chat_id, request_id, action_id, record)
+                return
+            if choice == "back":
+                record["stage"] = "provider"
+                record.pop("selected_provider", None)
+                record.pop("selected_provider_name", None)
+                record.pop("model_list", None)
+                await self._append_chat_event_async(
+                    chat_id,
+                    "input.requested",
+                    self._action_update_payload(action_id, record, self._model_picker_provider_payload(
+                        record.get("providers") or [],
+                        current_model=str(record.get("current_model") or ""),
+                        current_provider=str(record.get("current_provider") or ""),
+                    )),
+                )
+                await self._send_input_action_ack(request_id, chat_id, action_id)
+                return
+
+            stage = str(record.get("stage") or "provider")
+            providers = record.get("providers") or []
+            if stage == "provider":
+                provider_slug = choice.removeprefix("provider:")
+                provider = next((p for p in providers if p.get("slug") == provider_slug), None)
+                if provider is None:
+                    await self._send_chat_action_error(frame, "INVALID_CHOICE", "Invalid provider choice")
+                    return
+                models = [str(model) for model in provider.get("models", [])]
+                if not models:
+                    await self._send_chat_action_error(frame, "INVALID_CHOICE", "Provider has no selectable models")
+                    return
+                record["stage"] = "model"
+                record["selected_provider"] = provider_slug
+                record["selected_provider_name"] = str(provider.get("name") or provider_slug)
+                record["model_list"] = models
+                await self._append_chat_event_async(
+                    chat_id,
+                    "input.requested",
+                    self._action_update_payload(action_id, record, self._model_picker_model_payload(record, models)),
+                )
+                await self._send_input_action_ack(request_id, chat_id, action_id)
+                return
+
+            model_choice = choice.removeprefix("model:")
+            models = [str(model) for model in (record.get("model_list") or [])]
+            if model_choice.isdigit():
+                idx = int(model_choice)
+                model_id = models[idx] if 0 <= idx < len(models) else ""
+            else:
+                model_id = model_choice if model_choice in models else ""
+            if not model_id:
+                await self._send_chat_action_error(frame, "INVALID_CHOICE", "Invalid model choice")
+                return
+
+            callback = record.get("on_model_selected")
+            if not callable(callback):
+                await self._emit_action_expired(chat_id, action_id, "input", record, reason="resolver_lost")
+                await self._send_chat_action_error(frame, "STALE_ACTION", "This prompt is no longer available")
+                return
+
+            provider_slug = str(record.get("selected_provider") or "")
+            event_kind = "input.resolved"
+            try:
+                result_text = await callback(chat_id, model_id, provider_slug)
+            except Exception as exc:  # noqa: BLE001
+                event_kind = "input.failed"
+                result_text = f"Error switching model: {exc}"
+
+            self._action_cards.pop(action_id, None)
+            await self._append_chat_event_async(chat_id, event_kind, {
+                "turn_id": record.get("turn_id"),
+                "action_id": action_id,
+                "message_id": record.get("message_id"),
+                "choice": model_id,
+                "selected_model": model_id,
+                "selected_provider": provider_slug,
+                "message": str(result_text or ""),
+                "updated_at": _utc_iso(),
+            })
+            await self._send_input_action_ack(request_id, chat_id, action_id)
+
+        def _model_picker_provider_payload(
+            self,
+            providers: list[dict[str, Any]],
+            *,
+            current_model: str,
+            current_provider: str,
+        ) -> dict[str, Any]:
+            return {
+                "title": "Model Configuration",
+                "message": "Select a provider",
+                "choices": [
+                    {
+                        "id": f"provider:{provider['slug']}",
+                        "label": str(provider.get("name") or provider["slug"]),
+                    }
+                    for provider in providers
+                    if provider.get("slug")
+                ],
+                "input_mode": "choice",
+                "providers": providers,
+                "stage": "provider",
+                "current_model": current_model,
+                "current_provider": current_provider,
+            }
+
+        def _model_picker_model_payload(self, record: dict[str, Any], models: list[str]) -> dict[str, Any]:
+            return {
+                "title": "Model Configuration",
+                "message": f"Select a model for {record.get('selected_provider_name') or record.get('selected_provider') or ''}".strip(),
+                "choices": [
+                    {"id": f"model:{idx}", "label": model}
+                    for idx, model in enumerate(models)
+                ],
+                "input_mode": "choice",
+                "stage": "model",
+                "selected_provider": str(record.get("selected_provider") or ""),
+                "selected_provider_name": str(record.get("selected_provider_name") or ""),
+                "models": models,
+            }
+
+        def _action_update_payload(
+            self,
+            action_id: str,
+            record: dict[str, Any],
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            now = time.time()
+            return {
+                **payload,
+                "turn_id": record.get("turn_id"),
+                "action_id": action_id,
+                "message_id": record.get("message_id"),
+                "created_at": _utc_iso(now),
+                "expires_at": _utc_iso(float(record.get("expires_at") or now)),
+            }
+
+        async def _send_input_action_ack(self, request_id: str, chat_id: str, action_id: str) -> None:
             await self._send_frame({
                 "type": FRAME_CHAT_ACTION_ACK,
                 "request_id": request_id,
@@ -2249,12 +2980,15 @@ def make_adapter_class():
         def _gateway_runner(self) -> Any | None:
             runner = getattr(self, "_runner", None)
             if runner is not None:
+                self._install_runner_turn_lifecycle_wrapper(runner)
                 return runner
             try:
                 from gateway import run as gateway_run
 
                 runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
-                return runner_ref() if callable(runner_ref) else None
+                runner = runner_ref() if callable(runner_ref) else None
+                self._install_runner_turn_lifecycle_wrapper(runner)
+                return runner
             except Exception:  # noqa: BLE001
                 return None
 
@@ -2352,6 +3086,9 @@ def make_adapter_class():
 
         def _enqueue_message_event(self, event: Any) -> None:
             session_key = self._session_key_for_source(event.source)
+            message_id = str(getattr(event, "message_id", "") or "")
+            if message_id:
+                self._queued_events_by_message_id[message_id] = event
             runner = getattr(self, "_runner", None)
             if runner is None:
                 try:
@@ -2567,7 +3304,7 @@ def make_adapter_class():
         ) -> None:
             if record is not None and record.get("expired_emitted"):
                 return
-            event_kind = "approval.expired" if kind == "approval" else "confirm.expired"
+            event_kind = f"{kind}.expired" if kind in {"approval", "confirm", "input"} else "input.expired"
             payload = {
                 "turn_id": (record or {}).get("turn_id"),
                 "action_id": action_id,
@@ -2575,6 +3312,8 @@ def make_adapter_class():
                 "reason": reason,
                 "updated_at": _utc_iso(),
             }
+            if record is not None and record.get("response_text") is not None:
+                payload["response_text"] = str(record.get("response_text") or "")
             await self._append_chat_event_async(chat_id, event_kind, payload)
             if record is not None:
                 record["expired_emitted"] = True
@@ -2642,6 +3381,8 @@ def _native_chat_command(text: str) -> bool:
         return not args
     if command == "title":
         return bool(args.strip())
+    if command == "e2e-input":
+        return _e2e_input_tests_enabled() and args.strip() in {"clarify", "clarify-choice", "update", "model"}
     return command in {"queue", "steer"}
 
 
@@ -2667,6 +3408,10 @@ def _safe_id(value: Any) -> str:
     if not _ID_RE.match(text):
         return ""
     return text
+
+
+def _e2e_input_tests_enabled() -> bool:
+    return os.environ.get("VYLEN_E2E_INPUT_TESTS") == "1"
 
 
 def _message_id(prefix: str) -> str:
@@ -2726,6 +3471,86 @@ def _parse_tool_progress(content: Any) -> list[dict[str, str]]:
             "label": label,
         })
     return parsed
+
+
+def _validate_input_response(record: dict[str, Any], *, choice: str, text: str) -> tuple[bool, str, str]:
+    input_mode = str(record.get("input_mode") or "").strip()
+    choices = [str(item) for item in (record.get("choices") or [])]
+    if input_mode == "choice" or (choices and not input_mode):
+        if text:
+            return False, "CHAT_ACTION_INVALID", "Use one of the prompt choices."
+        if not choice:
+            return False, "INPUT_REQUIRED", "choice is required"
+        if choices and choice not in choices:
+            return False, "INVALID_CHOICE", "Choice is not available for this prompt."
+        return True, "", ""
+    if input_mode == "text" or (not choices and not input_mode):
+        if choice:
+            return False, "CHAT_ACTION_INVALID", "Use the prompt text field."
+        if not text:
+            return False, "INPUT_REQUIRED", "response is required"
+        return True, "", ""
+    if input_mode == "choice_or_text":
+        if not choice and not text:
+            return False, "INPUT_REQUIRED", "choice or text is required"
+        if choice and choices and choice not in choices:
+            return False, "INVALID_CHOICE", "Choice is not available for this prompt."
+        return True, "", ""
+    if not choice and not text:
+        return False, "INPUT_REQUIRED", "choice or text is required"
+    return True, "", ""
+
+
+def _normalize_update_answer(value: str, default: str) -> str:
+    raw = str(value or "").strip()
+    fallback = str(default or "").strip()
+    answer = raw or fallback
+    clean = answer.lower()
+    if clean in {"y", "yes", "approve", "approved", "true", "1"}:
+        return "y"
+    if clean in {"n", "no", "deny", "denied", "false", "0"}:
+        return "n"
+    return answer
+
+
+def _write_update_response(answer: str) -> None:
+    home = _hermes_home_for_update_response()
+    home.mkdir(parents=True, exist_ok=True)
+    response_path = home / ".update_response"
+    tmp = response_path.with_suffix(".tmp")
+    tmp.write_text(str(answer or ""))
+    tmp.replace(response_path)
+    (home / ".update_prompt.json").unlink(missing_ok=True)
+
+
+def _hermes_home_for_update_response() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path.home() / ".hermes"
+
+
+def _sanitize_model_providers(providers: Any) -> list[dict[str, Any]]:
+    safe: list[dict[str, Any]] = []
+    if not isinstance(providers, list):
+        return safe
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        slug = str(provider.get("slug") or "").strip()
+        if not slug:
+            continue
+        models = [str(model) for model in (provider.get("models") or [])]
+        safe.append({
+            "slug": slug,
+            "name": str(provider.get("name") or slug),
+            "models": models,
+            "total_models": int(provider.get("total_models") or len(models)),
+            "is_current": bool(provider.get("is_current")),
+        })
+    return safe
 
 
 def _chat_state_error_code(exc: Exception, *, fallback: str = "CHAT_STATE_UNAVAILABLE") -> str:

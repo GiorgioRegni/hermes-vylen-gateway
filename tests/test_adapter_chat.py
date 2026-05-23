@@ -217,6 +217,9 @@ def test_parse_tool_progress_requires_emoji_prefixed_progress_lines():
         "label": "",
     }]
     assert adapter_mod._parse_tool_progress("Note: not a tool") == []
+    assert adapter_mod._parse_tool_progress("Received choice: **detailed**.") == []
+    assert adapter_mod._parse_tool_progress("- read_file: Makefile") == []
+    assert adapter_mod._parse_tool_progress("* shell...") == []
 
 
 async def test_chat_event_append_emits_chat_index_changed_with_preview(adapter, monkeypatch):
@@ -480,6 +483,214 @@ async def test_message_queue_action_preserves_fifo_without_runner(adapter):
     await adapter.on_processing_complete(first, types.SimpleNamespace(value="success"))
     assert adapter._pending_messages[session_key].text == "second"
     assert [event.text for event in adapter._queued_events[session_key]] == ["third"]
+
+
+@pytest.mark.asyncio
+async def test_runner_drained_queued_turn_gets_its_own_lifecycle_and_output(adapter):
+    class FakeRunner:
+        async def _handle_message(self, event):
+            return None
+
+        async def _run_agent(self, **kwargs):
+            await adapter.send("chat_a", "💻 terminal: date")
+            await adapter.send("chat_a", "Sun May 24 04:14:50 UTC 2026")
+            return {"final_response": "Sun May 24 04:14:50 UTC 2026", "messages": []}
+
+    runner = FakeRunner()
+    adapter.set_message_handler(runner._handle_message)
+    original_turn_id = "turn_waiting_for_clarify"
+    adapter._active_turns_by_chat["chat_a"] = {"turn_id": original_turn_id, "message_id": "msg_active"}
+    queued_message_id = "msg_user_queued"
+    queued_turn_id = "turn_queued_time"
+    queued_event = adapter._build_message_event(
+        frame={
+            "request_id": "queue_req_1",
+            "chat_id": "chat_a",
+            "client_id": "phone",
+            "client_message_id": "client_queue_1",
+            "user_id": "user_1",
+            "user_name": "Giorgio",
+            "text": "what time is it?",
+        },
+        chat_id="chat_a",
+        text="what time is it?",
+        user_message_id=queued_message_id,
+        turn_id=queued_turn_id,
+        media_urls=[],
+        media_types=[],
+    )
+    await adapter._append_chat_event_async("chat_a", "message.created", {
+        "message_id": queued_message_id,
+        "role": "user",
+        "text": "what time is it?",
+        "status": "queued",
+        "created_at": "2026-05-24T04:14:00Z",
+        "turn_id": queued_turn_id,
+        "client_message_id": "client_queue_1",
+    })
+    adapter._queued_events_by_message_id[queued_message_id] = queued_event
+    session_key = "vylen:chat_a:user_1"
+    await asyncio.wait_for(
+        runner._run_agent(
+            source=queued_event.source,
+            session_key=session_key,
+            event_message_id=queued_message_id,
+        ),
+        timeout=5,
+    )
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    started = [event for event in events if event.kind == "turn.started"]
+    completed = [event for event in events if event.kind == "turn.completed"]
+    queued_user_updates = [
+        event for event in events
+        if event.kind == "message.updated" and event.payload.get("message_id") == queued_message_id
+    ]
+    activity_events = [event for event in events if event.kind == "activity.started"]
+    assistant_messages = [
+        event for event in events
+        if event.kind == "message.created" and event.payload.get("role") == "hermes"
+    ]
+    assistant_text_updates = [
+        event for event in events
+        if event.kind == "message.updated"
+        and event.payload.get("turn_id") == queued_turn_id
+        and event.payload.get("text") == "Sun May 24 04:14:50 UTC 2026"
+    ]
+
+    assert started[-1].payload["turn_id"] == queued_turn_id
+    assert completed[-1].payload["turn_id"] == queued_turn_id
+    assert queued_user_updates[0].payload["status"] == "running"
+    assert queued_user_updates[-1].payload["status"] == "completed"
+    assert activity_events[-1].payload["turn_id"] == queued_turn_id
+    assert assistant_messages[-1].payload["turn_id"] == queued_turn_id
+    assert assistant_text_updates
+    assert adapter._active_turns_by_chat["chat_a"]["turn_id"] == original_turn_id
+
+
+@pytest.mark.asyncio
+async def test_runner_turn_lifecycle_wrapper_uses_latest_adapter_after_reconnect(adapter):
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.adapter = adapter
+
+        async def _handle_message(self, event):
+            return None
+
+        async def _run_agent(self, **kwargs):
+            await self.adapter.send("chat_a", "runner response after reconnect")
+            return {"final_response": "runner response after reconnect", "messages": []}
+
+    runner = FakeRunner()
+    adapter.set_message_handler(runner._handle_message)
+
+    second_adapter = type(adapter)(config=types.SimpleNamespace(extra={}))
+    second_client = FakeClient()
+    second_adapter._instance_id = "inst_2"
+    second_adapter._client = second_client
+    second_adapter._chat_event_logs.set_event_loop(asyncio.get_event_loop())
+    second_adapter._chat_cursors = ChatCursorRelay(second_client.send, second_adapter._chat_event_logs)
+    second_adapter._fake_client = second_client
+    runner.adapter = second_adapter
+    second_adapter.set_message_handler(runner._handle_message)
+
+    queued_message_id = "msg_user_queued_reconnect"
+    queued_turn_id = "turn_queued_reconnect"
+    queued_event = second_adapter._build_message_event(
+        frame={
+            "request_id": "queue_req_reconnect",
+            "chat_id": "chat_a",
+            "client_id": "phone",
+            "client_message_id": "client_queue_reconnect",
+            "user_id": "user_1",
+            "user_name": "Giorgio",
+            "text": "queued after reconnect",
+        },
+        chat_id="chat_a",
+        text="queued after reconnect",
+        user_message_id=queued_message_id,
+        turn_id=queued_turn_id,
+        media_urls=[],
+        media_types=[],
+    )
+    await second_adapter._append_chat_event_async("chat_a", "message.created", {
+        "message_id": queued_message_id,
+        "role": "user",
+        "text": "queued after reconnect",
+        "status": "queued",
+        "created_at": "2026-05-24T04:14:00Z",
+        "turn_id": queued_turn_id,
+        "client_message_id": "client_queue_reconnect",
+    })
+    second_adapter._queued_events_by_message_id[queued_message_id] = queued_event
+
+    await runner._run_agent(
+        source=queued_event.source,
+        session_key="vylen:chat_a:user_1",
+        event_message_id=queued_message_id,
+    )
+
+    second_events = second_adapter._chat_event_logs.get("chat_a").events
+    second_started = [event for event in second_events if event.kind == "turn.started"]
+    second_completed = [event for event in second_events if event.kind == "turn.completed"]
+    second_assistant = [
+        event for event in second_events
+        if event.kind == "message.created" and event.payload.get("role") == "hermes"
+    ]
+
+    assert getattr(runner, "_vylen_turn_lifecycle_adapter") is second_adapter
+    assert queued_message_id not in adapter._queued_events_by_message_id
+    assert queued_message_id not in second_adapter._queued_events_by_message_id
+    assert second_started[-1].payload["turn_id"] == queued_turn_id
+    assert second_completed[-1].payload["turn_id"] == queued_turn_id
+    assert second_assistant[-1].payload["turn_id"] == queued_turn_id
+
+
+@pytest.mark.asyncio
+async def test_normal_queued_turn_start_clears_runner_drain_bookkeeping(adapter):
+    class FakeRunner:
+        async def _handle_message(self, event):
+            return None
+
+        async def _run_agent(self, **kwargs):
+            await adapter.send("chat_a", "should not be turn-bound")
+            return {"final_response": "should not be turn-bound", "messages": []}
+
+    runner = FakeRunner()
+    adapter.set_message_handler(runner._handle_message)
+    queued_event = adapter._build_message_event(
+        frame={
+            "request_id": "queue_req_1",
+            "chat_id": "chat_a",
+            "client_id": "phone",
+            "client_message_id": "client_queue_1",
+            "user_id": "user_1",
+            "user_name": "Giorgio",
+            "text": "normal drained queue",
+        },
+        chat_id="chat_a",
+        text="normal drained queue",
+        user_message_id="msg_user_queued",
+        turn_id="turn_normal_queue",
+        media_urls=[],
+        media_types=[],
+    )
+    adapter._queued_events_by_message_id["msg_user_queued"] = queued_event
+
+    await adapter.on_processing_start(queued_event)
+    assert "msg_user_queued" not in adapter._queued_events_by_message_id
+    await adapter.on_processing_complete(queued_event, types.SimpleNamespace(value="success"))
+    await runner._run_agent(
+        source=queued_event.source,
+        session_key="vylen:chat_a:user_1",
+        event_message_id="msg_user_queued",
+    )
+
+    events = adapter._chat_event_logs.get("chat_a").events
+    started = [event for event in events if event.kind == "turn.started" and event.payload.get("turn_id") == "turn_normal_queue"]
+    completed = [event for event in events if event.kind == "turn.completed" and event.payload.get("turn_id") == "turn_normal_queue"]
+    assert len(started) == 1
+    assert len(completed) == 1
 
 
 @pytest.mark.asyncio
@@ -1978,6 +2189,557 @@ async def test_mismatched_chat_action_does_not_expire_other_chat_card(adapter):
     assert adapter._chat_event_logs.get("chat_b") is None
 
 
+@pytest.mark.asyncio
+async def test_send_clarify_retains_input_requested_card(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    result = await adapter.send_clarify(
+        chat_id="chat_a",
+        question="Which workspace?",
+        choices=["Vylen", "Hermes"],
+        clarify_id="clarify_1",
+        session_key="session_a",
+    )
+
+    assert result.success
+    assert adapter._action_cards["clarify_1"]["kind"] == "input"
+    assert adapter._action_cards["clarify_1"]["input_kind"] == "clarify"
+    event = adapter._chat_event_logs.get("chat_a").events[-1]
+    assert event.kind == "input.requested"
+    assert event.payload["action_id"] == "clarify_1"
+    assert event.payload["choices"] == ["Vylen", "Hermes"]
+    assert event.payload["input_mode"] == "choice"
+
+
+@pytest.mark.asyncio
+async def test_clarify_input_response_resolves_gateway_callback(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    calls = _install_fake_clarify_tools(monkeypatch)
+    await adapter.send_clarify(
+        chat_id="chat_a",
+        question="Which workspace?",
+        choices=["Vylen", "Hermes"],
+        clarify_id="clarify_1",
+        session_key="session_a",
+    )
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "clarify_req",
+        "chat_id": "chat_a",
+        "action_id": "clarify_1",
+        "action": "input.respond",
+        "choice": "Hermes",
+    })
+
+    assert calls["clarify"] == [("clarify_1", "Hermes")]
+    assert "clarify_1" not in adapter._action_cards
+    kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
+    assert "input.resolved" in kinds
+    acks = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_ack"]
+    assert acks[-1]["request_id"] == "clarify_req"
+
+
+@pytest.mark.asyncio
+async def test_choice_clarify_rejects_text_response_without_resolving(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    calls = _install_fake_clarify_tools(monkeypatch)
+    await adapter.send_clarify(
+        chat_id="chat_a",
+        question="Which workspace?",
+        choices=["Vylen", "Hermes"],
+        clarify_id="clarify_1",
+        session_key="session_a",
+    )
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "clarify_text_req",
+        "chat_id": "chat_a",
+        "action_id": "clarify_1",
+        "action": "input.respond",
+        "text": "Something else",
+    })
+
+    assert calls["clarify"] == [("clarify_1", "")]
+    assert "clarify_1" in adapter._action_cards
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["request_id"] == "clarify_text_req"
+    assert errors[-1]["code"] == "CHAT_ACTION_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_choice_clarify_rejects_unknown_choice_without_resolving(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    calls = _install_fake_clarify_tools(monkeypatch)
+    await adapter.send_clarify(
+        chat_id="chat_a",
+        question="Which workspace?",
+        choices=["Vylen", "Hermes"],
+        clarify_id="clarify_1",
+        session_key="session_a",
+    )
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "clarify_unknown_req",
+        "chat_id": "chat_a",
+        "action_id": "clarify_1",
+        "action": "input.respond",
+        "choice": "Other",
+    })
+
+    assert calls["clarify"] == [("clarify_1", "")]
+    assert "clarify_1" in adapter._action_cards
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["request_id"] == "clarify_unknown_req"
+    assert errors[-1]["code"] == "INVALID_CHOICE"
+
+
+@pytest.mark.asyncio
+async def test_text_clarify_rejects_choice_response_without_resolving(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    calls = _install_fake_clarify_tools(monkeypatch)
+    await adapter.send_clarify(
+        chat_id="chat_a",
+        question="What token?",
+        choices=None,
+        clarify_id="clarify_1",
+        session_key="session_a",
+    )
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "clarify_choice_req",
+        "chat_id": "chat_a",
+        "action_id": "clarify_1",
+        "action": "input.respond",
+        "choice": "token",
+    })
+
+    assert calls["clarify"] == []
+    assert "clarify_1" in adapter._action_cards
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["request_id"] == "clarify_choice_req"
+    assert errors[-1]["code"] == "CHAT_ACTION_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_clarify_input_cancel_resolves_waiter_and_cancels_turn(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    calls = _install_fake_clarify_tools(monkeypatch)
+    adapter._active_turns_by_chat["chat_a"] = {
+        "turn_id": "turn_clarify_cancel",
+        "message_id": "msg_user_cancel",
+    }
+    await adapter.send_clarify(
+        chat_id="chat_a",
+        question="What should I use?",
+        choices=None,
+        clarify_id="clarify_1",
+        session_key="session_a",
+    )
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "clarify_cancel_req",
+        "chat_id": "chat_a",
+        "action_id": "clarify_1",
+        "action": "input.cancel",
+    })
+
+    assert calls["clarify"] == [("clarify_1", "")]
+    assert "clarify_1" not in adapter._action_cards
+    events = adapter._chat_event_logs.get("chat_a").events
+    kinds = [event.kind for event in events]
+    assert "input.cancelled" in kinds
+    assert "turn.cancelled" in kinds
+    cancelled = [event for event in events if event.kind == "turn.cancelled"]
+    assert cancelled[-1].payload["turn_id"] == "turn_clarify_cancel"
+    assert cancelled[-1].payload["reason"] == "input_cancelled"
+    messages = [event for event in events if event.kind == "message.created" and event.payload.get("role") == "hermes"]
+    assert messages[-1].payload["status"] == "cancelled"
+    assert "chat_a" not in adapter._active_turns_by_chat
+
+
+@pytest.mark.asyncio
+async def test_clarify_input_cancel_marks_retained_turn_cancelled_without_active_turn(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    calls = _install_fake_clarify_tools(monkeypatch)
+    adapter._active_turns_by_chat["chat_a"] = {
+        "turn_id": "turn_retained_clarify_cancel",
+        "message_id": "msg_user_cancel",
+    }
+    await adapter.send_clarify(
+        chat_id="chat_a",
+        question="What should I use?",
+        choices=["concise", "detailed"],
+        clarify_id="clarify_1",
+        session_key="session_a",
+    )
+    adapter._active_turns_by_chat.pop("chat_a", None)
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "clarify_cancel_req",
+        "chat_id": "chat_a",
+        "action_id": "clarify_1",
+        "action": "input.cancel",
+    })
+
+    assert calls["clarify"] == [("clarify_1", "")]
+    events = adapter._chat_event_logs.get("chat_a").events
+    cancelled = [event for event in events if event.kind == "turn.cancelled"]
+    assert cancelled[-1].payload["turn_id"] == "turn_retained_clarify_cancel"
+    assert cancelled[-1].payload["reason"] == "input_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_expired_clarify_input_emits_retained_expiry_and_error(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    calls = _install_fake_clarify_tools(monkeypatch)
+    adapter._action_ttl_seconds = -1
+    await adapter.send_clarify(
+        chat_id="chat_a",
+        question="Which workspace?",
+        choices=["Vylen", "Hermes"],
+        clarify_id="clarify_1",
+        session_key="session_a",
+    )
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "clarify_stale_req",
+        "chat_id": "chat_a",
+        "action_id": "clarify_1",
+        "action": "input.respond",
+        "choice": "Vylen",
+    })
+
+    assert calls["clarify"] == [("clarify_1", "")]
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["code"] == "STALE_ACTION"
+    kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
+    assert "input.requested" in kinds
+    assert "input.expired" in kinds
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_response_writes_hermes_update_response(adapter, monkeypatch, tmp_path):
+    _use_immediate_to_thread(monkeypatch)
+    hermes_constants = types.ModuleType("hermes_constants")
+    hermes_constants.get_hermes_home = lambda: tmp_path
+    monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+    (tmp_path / ".update_prompt.json").write_text("{}")
+    runner = types.SimpleNamespace(_update_prompt_pending={"session_a": True})
+
+    async def runner_handler(self, event):
+        return None
+
+    runner._handle_message = runner_handler.__get__(runner, type(runner))
+    adapter.set_message_handler(runner._handle_message)
+
+    result = await adapter.send_update_prompt(
+        chat_id="chat_a",
+        prompt="Apply config migration?",
+        default="n",
+        session_key="session_a",
+    )
+    assert result.success
+    action_id = next(iter(adapter._action_cards))
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "update_req",
+        "chat_id": "chat_a",
+        "action_id": action_id,
+        "action": "input.respond",
+        "choice": "y",
+    })
+
+    assert (tmp_path / ".update_response").read_text() == "y"
+    assert not (tmp_path / ".update_prompt.json").exists()
+    assert runner._update_prompt_pending == {}
+    assert action_id not in adapter._action_cards
+    kinds = [event.kind for event in adapter._chat_event_logs.get("chat_a").events]
+    assert "input.resolved" in kinds
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_cancel_writes_safe_denial(adapter, monkeypatch, tmp_path):
+    _use_immediate_to_thread(monkeypatch)
+    hermes_constants = types.ModuleType("hermes_constants")
+    hermes_constants.get_hermes_home = lambda: tmp_path
+    monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+    (tmp_path / ".update_prompt.json").write_text("{}")
+    runner = types.SimpleNamespace(_update_prompt_pending={"session_a": True})
+
+    async def runner_handler(self, event):
+        return None
+
+    runner._handle_message = runner_handler.__get__(runner, type(runner))
+    adapter.set_message_handler(runner._handle_message)
+
+    result = await adapter.send_update_prompt(
+        chat_id="chat_a",
+        prompt="Apply config migration?",
+        default="y",
+        session_key="session_a",
+    )
+    assert result.success
+    action_id = next(iter(adapter._action_cards))
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "update_cancel_req",
+        "chat_id": "chat_a",
+        "action_id": action_id,
+        "action": "input.cancel",
+    })
+
+    assert (tmp_path / ".update_response").read_text() == "n"
+    assert not (tmp_path / ".update_prompt.json").exists()
+    assert runner._update_prompt_pending == {}
+    assert action_id not in adapter._action_cards
+    events = adapter._chat_event_logs.get("chat_a").events
+    cancelled = [event for event in events if event.kind == "input.cancelled"]
+    assert cancelled[-1].payload["response_text"] == "n"
+
+
+@pytest.mark.asyncio
+async def test_expired_update_prompt_writes_safe_denial_and_clears_pending(adapter, monkeypatch, tmp_path):
+    _use_immediate_to_thread(monkeypatch)
+    hermes_constants = types.ModuleType("hermes_constants")
+    hermes_constants.get_hermes_home = lambda: tmp_path
+    monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+    (tmp_path / ".update_prompt.json").write_text("{}")
+    runner = types.SimpleNamespace(_update_prompt_pending={"session_a": True})
+
+    async def runner_handler(self, event):
+        return None
+
+    runner._handle_message = runner_handler.__get__(runner, type(runner))
+    adapter.set_message_handler(runner._handle_message)
+    adapter._action_ttl_seconds = -1
+
+    result = await adapter.send_update_prompt(
+        chat_id="chat_a",
+        prompt="Apply config migration?",
+        default="y",
+        session_key="session_a",
+    )
+    assert result.success
+    action_id = next(iter(adapter._action_cards))
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "update_expired_req",
+        "chat_id": "chat_a",
+        "action_id": action_id,
+        "action": "input.respond",
+        "choice": "yes",
+    })
+
+    assert (tmp_path / ".update_response").read_text() == "n"
+    assert not (tmp_path / ".update_prompt.json").exists()
+    assert runner._update_prompt_pending == {}
+    assert action_id not in adapter._action_cards
+    events = adapter._chat_event_logs.get("chat_a").events
+    expired = [event for event in events if event.kind == "input.expired"]
+    assert expired[-1].payload["response_text"] == "n"
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
+    assert errors[-1]["request_id"] == "update_expired_req"
+    assert errors[-1]["code"] == "STALE_ACTION"
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_pending_does_not_capture_composer_message(adapter, monkeypatch, tmp_path):
+    _use_immediate_to_thread(monkeypatch)
+    hermes_constants = types.ModuleType("hermes_constants")
+    hermes_constants.get_hermes_home = lambda: tmp_path
+    monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+    source = adapter._source_for_chat_action(_chat_message_frame(), "chat_a")
+    session_key = adapter._session_key_for_source(source)
+    handled: list[str] = []
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self._update_prompt_pending = {session_key: True}
+
+        async def _handle_message(self, event):
+            key = adapter._session_key_for_source(event.source)
+            if self._update_prompt_pending.get(key):
+                (tmp_path / ".update_response").write_text(event.text)
+                self._update_prompt_pending.pop(key, None)
+                return
+            handled.append(event.text)
+
+    runner = FakeRunner()
+
+    result = await adapter.send_update_prompt(
+        chat_id="chat_a",
+        prompt="Apply config migration?",
+        default="n",
+        session_key=session_key,
+    )
+    assert result.success
+    action_id = next(iter(adapter._action_cards))
+
+    adapter.set_message_handler(runner._handle_message)
+    release_runner = asyncio.Event()
+    runner_tasks: list[asyncio.Task] = []
+
+    async def start_background_runner(event):
+        async def run_later():
+            await release_runner.wait()
+            await adapter._message_handler(event)
+
+        runner_tasks.append(asyncio.create_task(run_later()))
+
+    adapter.handle_message = start_background_runner
+
+    await adapter._handle_chat_message(_chat_message_frame(text="yes"))
+    release_runner.set()
+    await asyncio.wait_for(runner_tasks[0], timeout=1)
+
+    assert handled == ["yes"]
+    assert not (tmp_path / ".update_response").exists()
+    assert runner._update_prompt_pending == {session_key: True}
+    assert action_id in adapter._action_cards
+
+
+@pytest.mark.asyncio
+async def test_clarify_pending_does_not_capture_composer_message(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    tools_mod = types.ModuleType("tools")
+    clarify_gateway_mod = types.ModuleType("tools.clarify_gateway")
+    source = adapter._source_for_chat_action(_chat_message_frame(), "chat_a")
+    session_key = adapter._session_key_for_source(source)
+    entry = types.SimpleNamespace(
+        clarify_id="clarify_1",
+        session_key=session_key,
+        awaiting_text=True,
+        event=asyncio.Event(),
+    )
+    captured: list[str] = []
+    handled: list[str] = []
+
+    def get_pending_for_session(key):
+        if key == session_key and entry.awaiting_text:
+            return entry
+        return None
+
+    clarify_gateway_mod.get_pending_for_session = get_pending_for_session
+    tools_mod.clarify_gateway = clarify_gateway_mod
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.clarify_gateway", clarify_gateway_mod)
+
+    result = await adapter.send_clarify(
+        chat_id="chat_a",
+        question="Which workspace?",
+        choices=None,
+        clarify_id="clarify_1",
+        session_key=session_key,
+    )
+    assert result.success
+
+    async def runner_handler(event):
+        pending = clarify_gateway_mod.get_pending_for_session(adapter._session_key_for_source(event.source))
+        if pending is not None:
+            captured.append(event.text)
+            pending.event.set()
+            return
+        handled.append(event.text)
+
+    adapter.set_message_handler(runner_handler)
+    release_runner = asyncio.Event()
+    runner_tasks: list[asyncio.Task] = []
+
+    async def start_background_runner(event):
+        async def run_later():
+            await release_runner.wait()
+            await adapter._message_handler(event)
+
+        runner_tasks.append(asyncio.create_task(run_later()))
+
+    adapter.handle_message = start_background_runner
+
+    await adapter._handle_chat_message(_chat_message_frame(text="Vylen"))
+    release_runner.set()
+    await asyncio.wait_for(runner_tasks[0], timeout=1)
+
+    assert captured == []
+    assert handled == ["Vylen"]
+    assert entry.awaiting_text is True
+    assert "clarify_1" in adapter._action_cards
+
+
+@pytest.mark.asyncio
+async def test_model_picker_requires_explicit_provider_then_model_selection(adapter, monkeypatch):
+    _use_immediate_to_thread(monkeypatch)
+    calls: list[tuple[str, str, str]] = []
+
+    async def on_model_selected(chat_id, model_id, provider_slug):
+        calls.append((chat_id, model_id, provider_slug))
+        return f"Switched to {model_id}"
+
+    result = await adapter.send_model_picker(
+        chat_id="chat_a",
+        providers=[{
+            "slug": "openai",
+            "name": "OpenAI",
+            "models": ["gpt-5", "gpt-5.1"],
+            "total_models": 2,
+        }],
+        current_model="gpt-5",
+        current_provider="openai",
+        session_key="session_a",
+        on_model_selected=on_model_selected,
+    )
+    assert result.success
+    action_id = next(iter(adapter._action_cards))
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "model_provider_req",
+        "chat_id": "chat_a",
+        "action_id": action_id,
+        "action": "input.respond",
+        "choice": "provider:openai",
+    })
+
+    assert calls == []
+    assert adapter._action_cards[action_id]["stage"] == "model"
+    model_events = [
+        event for event in adapter._chat_event_logs.get("chat_a").events
+        if event.kind == "input.requested" and event.payload.get("stage") == "model"
+    ]
+    assert model_events
+
+    await adapter._handle_chat_action({
+        "type": "chat_action",
+        "request_id": "model_select_req",
+        "chat_id": "chat_a",
+        "action_id": action_id,
+        "action": "input.respond",
+        "choice": "model:1",
+    })
+
+    assert calls == [("chat_a", "gpt-5.1", "openai")]
+    assert action_id not in adapter._action_cards
+    resolved = [
+        event for event in adapter._chat_event_logs.get("chat_a").events
+        if event.kind == "input.resolved"
+    ]
+    assert resolved[-1].payload["selected_model"] == "gpt-5.1"
+
+
+def _use_immediate_to_thread(monkeypatch):
+    async def immediate_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "to_thread", immediate_to_thread)
+
+
 def _install_fake_approval_tools(
     monkeypatch,
     *,
@@ -2021,6 +2783,22 @@ def _install_fake_approval_tools(
     monkeypatch.setitem(sys.modules, "tools", tools_mod)
     monkeypatch.setitem(sys.modules, "tools.approval", approval_mod)
     monkeypatch.setitem(sys.modules, "tools.slash_confirm", slash_confirm_mod)
+    return calls
+
+
+def _install_fake_clarify_tools(monkeypatch, *, resolve: bool = True):
+    tools_mod = types.ModuleType("tools")
+    clarify_gateway_mod = types.ModuleType("tools.clarify_gateway")
+    calls: dict[str, list[tuple[Any, ...]]] = {"clarify": []}
+
+    def resolve_gateway_clarify(clarify_id, response):
+        calls["clarify"].append((clarify_id, response))
+        return resolve
+
+    clarify_gateway_mod.resolve_gateway_clarify = resolve_gateway_clarify
+    tools_mod.clarify_gateway = clarify_gateway_mod
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.clarify_gateway", clarify_gateway_mod)
     return calls
 
 

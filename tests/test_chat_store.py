@@ -71,6 +71,9 @@ def test_chat_store_rejects_invalid_ids_kind_and_oversized_events(tmp_path):
         store.append_event("chat_a", "bad", {"text": "hello"})
     assert bad_kind.value.code == "invalid_event_kind"
 
+    input_event = store.append_event("chat_input", "input.requested", {})
+    assert input_event.kind == "input.requested"
+
     with pytest.raises(EventTooLarge) as too_large:
         store.append_event("chat_a", "message.created", {"text": "x" * 200})
     assert too_large.value.max_bytes == 32

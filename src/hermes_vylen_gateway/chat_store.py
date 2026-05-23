@@ -30,7 +30,7 @@ DEFAULT_GC_APPEND_INTERVAL = 100
 DEFAULT_GC_BYTES_INTERVAL = 8 * 1024 * 1024
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
-_KIND_RE = re.compile(r"^(push|message|turn|activity|approval|confirm|session|chat)\.[A-Za-z0-9_.:-]+$|^push$")
+_KIND_RE = re.compile(r"^(push|message|turn|activity|approval|confirm|input|session|chat)\.[A-Za-z0-9_.:-]+$|^push$")
 
 
 class ChatStateUnavailable(Exception):
