@@ -11,11 +11,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import mimetypes
 import logging
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -30,9 +33,9 @@ from .chat_cursor import (
     ChatCursorRelay,
 )
 from .chat_store import ChatStateStore, ChatStateUnavailable, InvalidChatStateEvent
-from .client import HandshakeError, VylenGatewayClient
+from .client import HandshakeError, ReadyInfo, VylenGatewayClient
 from .commands import FRAME_COMMANDS_REQUEST, CommandsRPC
-from .config import ConfigError, load_from_env
+from .config import ConfigError, GatewayConfig, load_all_from_env
 from .event_log import EventTooLarge
 from .health import HealthReporter
 from .memory import FRAME_MEMORY_REQUEST, MemoryRPC
@@ -114,6 +117,41 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("%s=%r is not an integer; using default %s", name, raw, default)
         return default
+
+
+async def _rank_gateway_configs(configs: list[GatewayConfig]) -> list[GatewayConfig]:
+    if len(configs) <= 1:
+        return configs
+    probes = await asyncio.gather(*(_relay_latency(cfg) for cfg in configs))
+    indexed = list(enumerate(zip(configs, probes)))
+    indexed.sort(key=lambda item: (item[1][1] is None, item[1][1] or float("inf"), item[0]))
+    return [cfg for _, (cfg, _) in indexed]
+
+
+async def _relay_latency(config: GatewayConfig) -> float | None:
+    started = time.perf_counter()
+    generation = await _relay_generation(config)
+    if generation is None:
+        return None
+    return time.perf_counter() - started
+
+
+async def _relay_generation(config: GatewayConfig) -> str | None:
+    return await asyncio.to_thread(_relay_generation_sync, config.cloud_url)
+
+
+def _relay_generation_sync(cloud_url: str) -> str | None:
+    url = cloud_url.rstrip("/") + "/v1/relays/health"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=2.0) as resp:  # noqa: S310 - operator-configured relay URL.
+            if resp.status != 200:
+                return None
+            payload = json.loads(resp.read(64 * 1024).decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    generation = payload.get("generation") if isinstance(payload, dict) else None
+    return str(generation or "") or None
 
 
 def _derive_chat_title_from_text(value: Any) -> str:
@@ -211,11 +249,12 @@ def make_adapter_class():
             self._response_sweep_task: asyncio.Task | None = None
             self._chat_sweep_task: asyncio.Task | None = None
             self._chat_sweep_request_task: asyncio.Task | None = None
+            self._relay_generation_task: asyncio.Task | None = None
             self._stopping = False
 
         async def connect(self) -> bool:
             try:
-                load_from_env()
+                load_all_from_env()
             except ConfigError as exc:
                 logger.error("Vylen gateway config invalid: %s", exc)
                 return False
@@ -292,16 +331,26 @@ def make_adapter_class():
 
         async def _open_session(self) -> bool:
             try:
-                gateway_cfg = load_from_env()
+                gateway_cfgs = load_all_from_env()
             except ConfigError as exc:
                 logger.error("Vylen gateway config invalid: %s", exc)
                 return False
-            client = VylenGatewayClient(gateway_cfg)
-            try:
-                ready = await client.connect()
-            except HandshakeError as exc:
-                logger.warning("Vylen gateway handshake failed: %s", exc)
-                await client.close()
+            ranked = await _rank_gateway_configs(gateway_cfgs)
+            client: VylenGatewayClient | None = None
+            ready: ReadyInfo | None = None
+            gateway_cfg: GatewayConfig | None = None
+            for candidate in ranked:
+                next_client = VylenGatewayClient(candidate)
+                try:
+                    ready = await next_client.connect()
+                except HandshakeError as exc:
+                    logger.warning("Vylen gateway handshake failed for %s: %s", candidate.cloud_url, exc)
+                    await next_client.close()
+                    continue
+                client = next_client
+                gateway_cfg = candidate
+                break
+            if client is None or ready is None or gateway_cfg is None:
                 return False
             self._client = client
             self._instance_id = ready.instance_id
@@ -335,13 +384,25 @@ def make_adapter_class():
             self._transcribe = Transcriber(client.send)
             self._memory = MemoryRPC(client.send)
             self._commands = CommandsRPC(client.send)
+            if ready.relay_generation:
+                self._relay_generation_task = asyncio.create_task(
+                    self._watch_relay_generation(client, gateway_cfg, ready.relay_generation),
+                    name="vylen-relay-generation-watch",
+                )
             logger.info(
-                "Vylen gateway online: instance_id=%s user_id=%s hermes=in-process",
-                ready.instance_id, ready.user_id,
+                "Vylen gateway online: instance_id=%s user_id=%s relay=%s generation=%s hermes=in-process",
+                ready.instance_id, ready.user_id, ready.relay_id or gateway_cfg.cloud_url, ready.relay_generation,
             )
             return True
 
         async def _teardown_session(self) -> None:
+            if self._relay_generation_task:
+                self._relay_generation_task.cancel()
+                try:
+                    await self._relay_generation_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                self._relay_generation_task = None
             if self._response_sweep_task:
                 self._response_sweep_task.cancel()
                 try:
@@ -390,6 +451,27 @@ def make_adapter_class():
             if self._client:
                 await self._client.close()
                 self._client = None
+
+        async def _watch_relay_generation(
+            self,
+            client: VylenGatewayClient,
+            gateway_cfg: GatewayConfig,
+            socket_generation: str,
+        ) -> None:
+            interval = _env_float("VYLEN_RELAY_GENERATION_CHECK_SECONDS", 30.0)
+            while not self._stopping:
+                await asyncio.sleep(max(5.0, interval))
+                current = await _relay_generation(gateway_cfg)
+                if not current or current == socket_generation:
+                    continue
+                logger.info(
+                    "Vylen relay generation changed for %s: socket=%s current=%s; reconnecting",
+                    gateway_cfg.cloud_url,
+                    socket_generation,
+                    current,
+                )
+                await client.close()
+                return
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
             from gateway.platforms.base import SendResult
@@ -2621,7 +2703,7 @@ def check_dependencies() -> bool:
     - websockets importable (it's our own dep so it always is when we are)
     """
     try:
-        load_from_env()
+        load_all_from_env()
     except ConfigError as exc:
         logger.info("Vylen gateway not configured: %s", exc)
         return False

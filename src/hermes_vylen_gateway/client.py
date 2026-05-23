@@ -35,6 +35,9 @@ class ReadyInfo:
     instance_id: str
     user_id: str
     server_time: str
+    relay_id: str = ""
+    relay_generation: str = ""
+    relay_region: str = ""
 
 
 @dataclass
@@ -129,10 +132,26 @@ class VylenGatewayClient:
         instance_id = frame.get("instance_id") or ""
         user_id = frame.get("user_id") or ""
         server_time = frame.get("server_time") or ""
+        relay_id = frame.get("relay_id") or ""
+        relay_generation = frame.get("relay_generation") or ""
+        relay_region = frame.get("relay_region") or ""
         if not instance_id:
             raise HandshakeError("ready frame missing instance_id")
-        logger.info("Handshake OK: instance_id=%s user_id=%s", instance_id, user_id)
-        return ReadyInfo(instance_id=instance_id, user_id=user_id, server_time=server_time)
+        logger.info(
+            "Handshake OK: instance_id=%s user_id=%s relay=%s generation=%s",
+            instance_id,
+            user_id,
+            relay_id,
+            relay_generation,
+        )
+        return ReadyInfo(
+            instance_id=instance_id,
+            user_id=user_id,
+            server_time=server_time,
+            relay_id=relay_id,
+            relay_generation=relay_generation,
+            relay_region=relay_region,
+        )
 
     async def iter_frames(
         self,

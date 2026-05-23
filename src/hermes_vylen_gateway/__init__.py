@@ -12,7 +12,7 @@ import os
 
 from .adapter import adapter_factory, check_dependencies
 from .client import HandshakeError, ReadyInfo, VylenGatewayClient
-from .config import GatewayConfig, ConfigError, load_from_env
+from .config import GatewayConfig, ConfigError, load_all_from_env, load_from_env
 
 __all__ = [
     "register",
@@ -21,6 +21,7 @@ __all__ = [
     "HandshakeError",
     "ReadyInfo",
     "VylenGatewayClient",
+    "load_all_from_env",
     "load_from_env",
 ]
 

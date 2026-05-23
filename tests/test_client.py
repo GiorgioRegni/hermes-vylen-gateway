@@ -77,6 +77,9 @@ async def _mock_cloud(port: int, *, behavior: str = "ok"):
             "instance_id": "inst_test",
             "user_id": "giorgio",
             "server_time": "2026-05-13T00:00:00Z",
+            "relay_id": "relay-test",
+            "relay_generation": "gen-test",
+            "relay_region": "us-central1",
         }))
         # Hold the socket open until the client closes.
         try:
@@ -97,6 +100,9 @@ async def test_handshake_ok():
         ready = await client.connect(timeout=3.0)
         assert ready.instance_id == "inst_test"
         assert ready.user_id == "giorgio"
+        assert ready.relay_id == "relay-test"
+        assert ready.relay_generation == "gen-test"
+        assert ready.relay_region == "us-central1"
         await client.close()
     finally:
         server.close()
