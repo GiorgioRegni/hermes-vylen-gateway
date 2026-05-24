@@ -219,6 +219,102 @@ def test_parse_tool_progress_requires_emoji_prefixed_progress_lines():
     assert adapter_mod._parse_tool_progress("Note: not a tool") == []
 
 
+async def test_chat_event_append_emits_chat_index_changed_with_preview(adapter, monkeypatch):
+    monkeypatch.setattr(asyncio, "to_thread", _run_sync_as_async)
+    adapter._fake_client.sent.clear()
+
+    await adapter._append_chat_event_async("chat_a", "message.created", {
+        "message_id": "msg_1",
+        "role": "user",
+        "text": "hello from user",
+        "created_at": "2026-05-23T12:00:00Z",
+    })
+
+    frames = [
+        frame
+        for frame in adapter._fake_client.sent
+        if frame["type"] == adapter_mod.FRAME_CHAT_INDEX_CHANGED
+    ]
+    assert frames
+    frame = frames[-1]
+    assert frame["instance_id"] == "inst_1"
+    assert frame["chat_id"] == "chat_a"
+    assert frame["chat"]["chat_id"] == "chat_a"
+    assert frame["chat"]["preview"]["last_message_preview"] == "hello from user"
+
+
+async def test_chat_message_update_does_not_emit_chat_index_changed(adapter, monkeypatch):
+    monkeypatch.setattr(asyncio, "to_thread", _run_sync_as_async)
+    await adapter._append_chat_event_async("chat_a", "message.created", {
+        "message_id": "msg_1",
+        "role": "hermes",
+        "text": "initial",
+        "created_at": "2026-05-23T12:00:00Z",
+    })
+    adapter._fake_client.sent.clear()
+
+    await adapter._append_chat_event_async("chat_a", "message.updated", {
+        "message_id": "msg_1",
+        "role": "hermes",
+        "text": "streaming update",
+        "updated_at": "2026-05-23T12:00:01Z",
+    })
+
+    assert not [
+        frame
+        for frame in adapter._fake_client.sent
+        if frame["type"] == adapter_mod.FRAME_CHAT_INDEX_CHANGED
+    ]
+
+
+async def test_deleted_chat_emits_chat_index_changed_deleted_frame(adapter, monkeypatch):
+    monkeypatch.setattr(asyncio, "to_thread", _run_sync_as_async)
+    await adapter._append_chat_event_async("chat_a", "message.created", {
+        "message_id": "msg_1",
+        "role": "user",
+        "text": "hello",
+        "created_at": "2026-05-23T12:00:00Z",
+    })
+    adapter._fake_client.sent.clear()
+
+    await asyncio.to_thread(adapter._chat_event_logs.mark_deleted, "chat_a")
+    await adapter._emit_chat_index_changed("chat_a")
+
+    frames = [
+        frame
+        for frame in adapter._fake_client.sent
+        if frame["type"] == adapter_mod.FRAME_CHAT_INDEX_CHANGED
+    ]
+    assert frames
+    assert frames[-1]["instance_id"] == "inst_1"
+    assert frames[-1]["chat_id"] == "chat_a"
+    assert frames[-1]["deleted"] is True
+    assert frames[-1]["chat"]["chat_id"] == "chat_a"
+
+
+async def test_chat_index_changed_skips_unavailable_chat_state(adapter, monkeypatch):
+    monkeypatch.setattr(asyncio, "to_thread", _run_sync_as_async)
+
+    class UnavailableChatState:
+        def get_chat(self, *args, **kwargs):
+            raise ChatStateUnavailable("chat state unavailable")
+
+    adapter._fake_client.sent.clear()
+    adapter._chat_event_logs = UnavailableChatState()
+
+    await adapter._emit_chat_index_changed("chat_a")
+
+    assert not [
+        frame
+        for frame in adapter._fake_client.sent
+        if frame["type"] == adapter_mod.FRAME_CHAT_INDEX_CHANGED
+    ]
+
+
+async def _run_sync_as_async(func, /, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
 def test_tool_progress_activity_id_is_stable_when_label_changes():
     first = adapter_mod._activity_id("turn_1", "msg_progress", 0, {
         "tool": "read_file",

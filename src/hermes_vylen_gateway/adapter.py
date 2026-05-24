@@ -52,9 +52,11 @@ FRAME_CHAT_MESSAGE_ERROR = "chat_message_error"
 FRAME_CHAT_ACTION = "chat_action"
 FRAME_CHAT_ACTION_ACK = "chat_action_ack"
 FRAME_CHAT_ACTION_ERROR = "chat_action_error"
+FRAME_CHAT_INDEX_CHANGED = "chat_index_changed"
 VYLEN_ALLOWED_USERS_ENV = "VYLEN_ALLOWED_USERS"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+_CHAT_INDEX_EVENT_KINDS = {"message.created", "chat.renamed", "chat.deleted", "push"}
 _TOOL_PROGRESS_LINE_RE = re.compile(
     r"^(?P<emoji>\S+)\s+(?P<tool>[A-Za-z_][A-Za-z0-9_.-]*)(?:(?P<ellipsis>\.\.\.)|:\s*(?P<label>.*))$"
 )
@@ -566,6 +568,7 @@ def make_adapter_class():
             try:
                 if self._chat_cursors is not None:
                     await self._chat_cursors.send_push(frame)
+                    await self._emit_chat_index_changed(frame["chat_id"])
                 else:
                     await self._client.send(frame)
             except Exception as exc:  # noqa: BLE001
@@ -1147,6 +1150,7 @@ def make_adapter_class():
                         event = await asyncio.to_thread(self._chat_event_logs.rename_chat, chat_id, title)
                         self._maybe_schedule_chat_state_sweep()
                         title = str(event.payload.get("title") or title)
+                        await self._emit_chat_index_changed(chat_id)
                     else:
                         await self._append_chat_event_async(chat_id, "chat.renamed", {
                             "chat_id": chat_id,
@@ -1430,6 +1434,7 @@ def make_adapter_class():
                     if hasattr(self._chat_event_logs, "mark_deleted"):
                         await asyncio.to_thread(self._chat_event_logs.mark_deleted, chat_id)
                         self._maybe_schedule_chat_state_sweep()
+                        await self._emit_chat_index_changed(chat_id)
                     else:
                         await self._append_chat_event_async(chat_id, "chat.deleted", {
                             "chat_id": chat_id,
@@ -1455,6 +1460,7 @@ def make_adapter_class():
                         event = await asyncio.to_thread(self._chat_event_logs.rename_chat, chat_id, title)
                         self._maybe_schedule_chat_state_sweep()
                         title = str(event.payload.get("title") or title)
+                        await self._emit_chat_index_changed(chat_id)
                     else:
                         await self._append_chat_event_async(chat_id, "chat.renamed", {
                             "chat_id": chat_id,
@@ -1845,7 +1851,34 @@ def make_adapter_class():
         async def _append_chat_event_async(self, chat_id: str, kind: str, payload: dict[str, Any]) -> int | None:
             seq = await asyncio.to_thread(self._append_chat_event_sync, chat_id, kind, payload)
             self._maybe_schedule_chat_state_sweep()
+            if kind in _CHAT_INDEX_EVENT_KINDS:
+                await self._emit_chat_index_changed(chat_id)
             return seq
+
+        async def _emit_chat_index_changed(self, chat_id: str) -> None:
+            if self._client is None or not self._instance_id:
+                return
+            if not hasattr(self._chat_event_logs, "get_chat"):
+                return
+            try:
+                row = await asyncio.to_thread(self._chat_event_logs.get_chat, chat_id, include_deleted=True)
+            except Exception:  # noqa: BLE001
+                logger.debug("vylen gateway: chat index read failed", exc_info=True)
+                return
+            if row is None:
+                return
+            frame: dict[str, Any] = {
+                "type": FRAME_CHAT_INDEX_CHANGED,
+                "instance_id": self._instance_id,
+                "chat_id": row.chat_id,
+                "chat": row.to_response(include_preview=True),
+            }
+            if row.deleted_at:
+                frame["deleted"] = True
+            try:
+                await self._client.send(frame)
+            except Exception:  # noqa: BLE001
+                logger.debug("vylen gateway: chat index send failed", exc_info=True)
 
         def _maybe_schedule_chat_state_sweep(self) -> None:
             if not hasattr(self._chat_event_logs, "consume_sweep_requested"):
@@ -2154,6 +2187,7 @@ def make_adapter_class():
                 if hasattr(self._chat_event_logs, "rename_chat"):
                     await asyncio.to_thread(self._chat_event_logs.rename_chat, chat_id, title)
                     self._maybe_schedule_chat_state_sweep()
+                    await self._emit_chat_index_changed(chat_id)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Failed to sync Hermes auto-title to Vylen chat: %s", exc)
 
