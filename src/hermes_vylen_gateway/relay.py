@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # chunk fragments the file across many frames and slows transfer). 256 KiB
 # is a comfortable middle for typical Hermes-generated images.
 _BLOB_CHUNK_BYTES = 256 * 1024
+_RESPONSE_CHUNK_BYTES = 256 * 1024
 
 # Frame type constants — keep in sync with cloud/internal/cloud/gateway.go.
 FRAME_REQUEST = "request"
@@ -361,13 +362,15 @@ class _FrameStreamWriter:
             return
         if not self._sent_headers:
             await self.send_headers(200, {})
-        self._append_buffer(chunk)
-        await self._send({
-            "type": FRAME_RESPONSE_CHUNK,
-            "request_id": self._request_id,
-            "data": base64.b64encode(chunk).decode("ascii"),
-        })
-        self._progress.mark()
+        for offset in range(0, len(chunk), _RESPONSE_CHUNK_BYTES):
+            part = chunk[offset:offset + _RESPONSE_CHUNK_BYTES]
+            self._append_buffer(part)
+            await self._send({
+                "type": FRAME_RESPONSE_CHUNK,
+                "request_id": self._request_id,
+                "data": base64.b64encode(part).decode("ascii"),
+            })
+            self._progress.mark()
 
     async def finish(self) -> None:
         if self._finished:

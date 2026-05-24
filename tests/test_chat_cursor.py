@@ -11,6 +11,8 @@ from hermes_vylen_gateway.chat_cursor import (
     FRAME_CHAT_RESUME_EXPIRED,
     FRAME_CHAT_SNAPSHOT_RESPONSE,
     ChatCursorRelay,
+    _CHAT_STATE_FRAME_TARGET_BYTES,
+    _frame_json_bytes,
 )
 from hermes_vylen_gateway.chat_store import ChatStateConfig, ChatStateStore
 from hermes_vylen_gateway.event_log import EventLogRegistry
@@ -326,6 +328,38 @@ async def test_chat_list_and_snapshot_frames_read_sqlite_store(tmp_path):
     assert snapshot_response["events"][0]["event"]["payload"]["text"] == "hello"
     assert snapshot_response["next_after_seq"] == 1
     assert snapshot_response["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_chat_snapshot_response_is_byte_bounded(tmp_path):
+    sent: list[dict] = []
+
+    async def send(frame: dict) -> None:
+        sent.append(frame)
+
+    store = ChatStateStore(
+        tmp_path / "chat-state.sqlite3",
+        config=ChatStateConfig(max_event_bytes=1024 * 1024),
+    )
+    relay = ChatCursorRelay(send, store)
+    large_text = "x" * (800 * 1024)
+    relay.append_event("chat_a", "message.created", {"message_id": "msg_1", "text": large_text})
+    relay.append_event("chat_a", "message.created", {"message_id": "msg_2", "text": large_text})
+    relay.append_event("chat_a", "message.created", {"message_id": "msg_3", "text": large_text})
+
+    await relay.handle_snapshot({
+        "type": "chat_snapshot",
+        "request_id": "req_snapshot",
+        "chat_id": "chat_a",
+        "after_seq": 0,
+        "limit": 500,
+    })
+
+    snapshot_response = next(frame for frame in sent if frame["type"] == FRAME_CHAT_SNAPSHOT_RESPONSE)
+    assert _frame_json_bytes(snapshot_response) <= _CHAT_STATE_FRAME_TARGET_BYTES
+    assert [event["seq"] for event in snapshot_response["events"]] == [1, 2]
+    assert snapshot_response["next_after_seq"] == 2
+    assert snapshot_response["has_more"] is True
 
 
 @pytest.mark.asyncio

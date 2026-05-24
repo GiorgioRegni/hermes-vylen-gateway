@@ -20,6 +20,8 @@ from hermes_vylen_gateway.relay import (
 )
 from hermes_vylen_gateway.response_buffer import ResponseBufferRegistry
 
+MAX_RESPONSE_CHUNK = 256 * 1024
+
 
 async def _write_paced_response(writer, gate: asyncio.Event) -> int:
     await writer.send_headers(200, {"Content-Type": "text/event-stream"})
@@ -46,6 +48,16 @@ def _collect_for(request_id: str, frames: list[dict[str, Any]]) -> bytes:
         if f.get("request_id") == request_id and f["type"] == FRAME_RESPONSE_CHUNK:
             body += base64.b64decode(f["data"])
     return body
+
+
+async def _write_large_response(writer) -> int:
+    await writer.send_headers(200, {"Content-Type": "text/event-stream"})
+    await writer.send_chunk(
+        b'event: response.created\ndata: {"response":{"id":"resp_big_resume"}}\n\n'
+        + b"x" * (MAX_RESPONSE_CHUNK + 1)
+    )
+    await writer.finish()
+    return 200
 
 
 @pytest.mark.asyncio
@@ -108,6 +120,59 @@ async def test_resume_replays_from_cursor_after_completion(monkeypatch):
         f for f in frames if f.get("request_id") == "req_resume" and f["type"] == FRAME_RESPONSE_HEADERS
     )
     assert resume_headers["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_resume_replays_split_large_response_chunks(monkeypatch):
+    async def fake_dispatch(method, path, headers, body, writer):
+        return await _write_large_response(writer)
+
+    monkeypatch.setattr(agent_runner, "dispatch", fake_dispatch)
+    frames: list[dict[str, Any]] = []
+    original_done = asyncio.Event()
+    resume_done = asyncio.Event()
+
+    async def send(frame):
+        frames.append(frame)
+        if frame["type"] == FRAME_RESPONSE_END and frame.get("request_id") == "req_orig_big":
+            original_done.set()
+        if frame["type"] == FRAME_RESPONSE_END and frame.get("request_id") == "req_resume_big":
+            resume_done.set()
+
+    buffers = ResponseBufferRegistry(grace_seconds=300.0, max_bytes=2 << 20)
+    relay = HermesRelay(send, response_buffers=buffers)
+    try:
+        await relay.handle({
+            "type": FRAME_REQUEST,
+            "request_id": "req_orig_big",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": {"Content-Type": "application/json"},
+            "body": base64.b64encode(b'{"input":"hi","stream":true}').decode(),
+            "stream": True,
+        })
+        await asyncio.wait_for(original_done.wait(), timeout=3.0)
+
+        await relay.handle_resume({
+            "type": FRAME_RESPONSE_RESUME,
+            "request_id": "req_resume_big",
+            "response_id": "resp_big_resume",
+            "after_cursor": 0,
+        })
+        await asyncio.wait_for(resume_done.wait(), timeout=3.0)
+    finally:
+        await relay.close()
+
+    original_body = _collect_for("req_orig_big", frames)
+    resume_body = _collect_for("req_resume_big", frames)
+    assert resume_body == original_body
+    resume_chunks = [
+        base64.b64decode(f["data"])
+        for f in frames
+        if f.get("request_id") == "req_resume_big" and f["type"] == FRAME_RESPONSE_CHUNK
+    ]
+    assert resume_chunks
+    assert all(len(chunk) <= MAX_RESPONSE_CHUNK for chunk in resume_chunks)
 
 
 @pytest.mark.asyncio

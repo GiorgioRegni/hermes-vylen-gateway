@@ -18,6 +18,8 @@ from hermes_vylen_gateway.relay import (
 )
 from hermes_vylen_gateway.response_buffer import ResponseBufferRegistry
 
+MAX_RESPONSE_CHUNK = 256 * 1024
+
 
 async def _write_sample_response(writer) -> int:
     await writer.send_headers(200, {"Content-Type": "text/event-stream"})
@@ -81,6 +83,45 @@ async def test_relay_streams_in_process_response_back_to_cloud(monkeypatch):
     assert b"event: response.created" in body
     assert b"event: response.output_text.delta" in body
     assert b"event: response.completed" in body
+
+
+@pytest.mark.asyncio
+async def test_relay_splits_large_response_chunks(monkeypatch):
+    original = b"x" * (MAX_RESPONSE_CHUNK + 1)
+
+    async def fake_dispatch(method, path, headers, body, writer):
+        await writer.send_headers(200, {"Content-Type": "application/octet-stream"})
+        await writer.send_chunk(original)
+        await writer.finish()
+        return 200
+
+    monkeypatch.setattr(agent_runner, "dispatch", fake_dispatch)
+    sent_frames: list[dict] = []
+    sent_event = asyncio.Event()
+
+    async def send(frame):
+        sent_frames.append(frame)
+        if frame["type"] == FRAME_RESPONSE_END:
+            sent_event.set()
+
+    relay = HermesRelay(send)
+    try:
+        await relay.handle({
+            "type": FRAME_REQUEST,
+            "request_id": "req_large",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": {"Content-Type": "application/json"},
+            "body": base64.b64encode(b'{"input":"hi","stream":true}').decode(),
+            "stream": True,
+        })
+        await asyncio.wait_for(sent_event.wait(), timeout=3.0)
+    finally:
+        await relay.close()
+
+    chunks = [base64.b64decode(f["data"]) for f in sent_frames if f["type"] == FRAME_RESPONSE_CHUNK]
+    assert [len(c) for c in chunks] == [MAX_RESPONSE_CHUNK, 1]
+    assert b"".join(chunks) == original
 
 
 @pytest.mark.asyncio
@@ -234,3 +275,43 @@ async def test_relay_populates_response_buffer_for_resume(monkeypatch):
     assert b"event: response.created" in body
     assert b"event: response.output_text.delta" in body
     assert b"event: response.completed" in body
+
+
+@pytest.mark.asyncio
+async def test_relay_buffers_split_response_chunks_for_resume(monkeypatch):
+    original = b'event: response.created\ndata: {"response":{"id":"resp_big"}}\n\n' + b"x" * (MAX_RESPONSE_CHUNK + 1)
+
+    async def fake_dispatch(method, path, headers, body, writer):
+        await writer.send_headers(200, {"Content-Type": "text/event-stream"})
+        await writer.send_chunk(original)
+        await writer.finish()
+        return 200
+
+    monkeypatch.setattr(agent_runner, "dispatch", fake_dispatch)
+    sent_event = asyncio.Event()
+
+    async def send(frame):
+        if frame["type"] == FRAME_RESPONSE_END:
+            sent_event.set()
+
+    buffers = ResponseBufferRegistry(grace_seconds=300.0, max_bytes=2 << 20)
+    relay = HermesRelay(send, response_buffers=buffers)
+    try:
+        await relay.handle({
+            "type": FRAME_REQUEST,
+            "request_id": "req_big_buf",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": {"Content-Type": "application/json"},
+            "body": base64.b64encode(b'{"input":"hi","stream":true}').decode(),
+            "stream": True,
+        })
+        await asyncio.wait_for(sent_event.wait(), timeout=3.0)
+    finally:
+        await relay.close()
+
+    buf = buffers.get("resp_big")
+    assert buf is not None
+    assert buf.complete is True
+    assert all(len(chunk) <= MAX_RESPONSE_CHUNK for chunk in buf.chunks)
+    assert b"".join(buf.chunks) == original

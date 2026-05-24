@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import json
 import re
 import uuid
 from typing import Any, Awaitable, Callable
@@ -23,6 +24,8 @@ FRAME_CHAT_SNAPSHOT_RESPONSE = "chat_snapshot_response"
 FRAME_CHAT_SNAPSHOT_ERROR = "chat_snapshot_error"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+_CHAT_STATE_FRAME_BYTES = 2 * 1024 * 1024
+_CHAT_STATE_FRAME_TARGET_BYTES = _CHAT_STATE_FRAME_BYTES - (64 * 1024)
 
 
 class ChatCursorRelay:
@@ -167,26 +170,39 @@ class ChatCursorRelay:
                 after_seq=_parse_seq(frame.get("after_seq")),
                 limit=_parse_limit(frame.get("limit"), default=500, maximum=1000),
             )
-            await self._send({
+            response = {
                 "type": FRAME_CHAT_SNAPSHOT_RESPONSE,
                 "request_id": request_id,
                 "chat_id": chat_id,
                 "chat": page.chat.to_response(include_preview=True) if page.chat else None,
-                "events": [
-                    {
-                        "seq": event.seq,
-                        "occurred_at": _iso_time(event.created_at),
-                        "event": {
-                            "kind": event.kind,
-                            "payload": event.payload,
-                        },
-                    }
-                    for event in page.events
-                ],
+                "events": [],
                 "next_after_seq": page.next_after_seq,
                 "has_more": page.has_more,
                 "deleted": page.deleted,
-            })
+            }
+            selected: list[dict[str, Any]] = []
+            for index, event in enumerate(page.events):
+                selected.append(_event_to_snapshot_response(event))
+                response["events"] = selected
+                response["next_after_seq"] = event.seq
+                response["has_more"] = page.has_more or index < len(page.events) - 1
+                if _frame_json_bytes(response) <= _CHAT_STATE_FRAME_TARGET_BYTES:
+                    continue
+                selected.pop()
+                if not selected:
+                    await self._send_error(
+                        FRAME_CHAT_SNAPSHOT_ERROR,
+                        request_id,
+                        "CHAT_SNAPSHOT_TOO_LARGE",
+                        "One retained chat event is too large to return",
+                        chat_id=chat_id,
+                    )
+                    return
+                response["events"] = selected
+                response["next_after_seq"] = selected[-1]["seq"]
+                response["has_more"] = True
+                break
+            await self._send(response)
         except ResumeExpired as exc:
             await self._send({
                 "type": FRAME_CHAT_SNAPSHOT_ERROR,
@@ -306,6 +322,21 @@ def _parse_limit(value: Any, *, default: int, maximum: int) -> int:
         return min(max(1, int(value)), maximum)
     except (TypeError, ValueError):
         return default
+
+
+def _event_to_snapshot_response(event: Any) -> dict[str, Any]:
+    return {
+        "seq": event.seq,
+        "occurred_at": _iso_time(event.created_at),
+        "event": {
+            "kind": event.kind,
+            "payload": event.payload,
+        },
+    }
+
+
+def _frame_json_bytes(frame: dict[str, Any]) -> int:
+    return len(json.dumps(frame).encode("utf-8"))
 
 
 def _clean_search_query(value: Any) -> str:
