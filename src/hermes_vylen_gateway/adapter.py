@@ -882,6 +882,7 @@ def make_adapter_class():
             try:
                 if self._chat_cursors is not None:
                     await self._chat_cursors.send_push(frame)
+                    await self._emit_chat_index_changed(frame["chat_id"])
                 else:
                     await self._client.send(frame)
             except Exception as exc:  # noqa: BLE001

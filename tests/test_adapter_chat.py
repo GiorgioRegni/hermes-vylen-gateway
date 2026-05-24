@@ -1628,6 +1628,42 @@ async def test_generated_image_file_is_retained_as_chat_attachment(adapter, tmp_
 
 
 @pytest.mark.asyncio
+async def test_plugin_initiated_image_push_emits_chat_index_changed(adapter, monkeypatch, tmp_path):
+    monkeypatch.setattr(asyncio, "to_thread", _run_sync_as_async)
+    image_path = tmp_path / "landscape.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    adapter._fake_client.sent.clear()
+
+    class FakePushRelay:
+        async def send_push(self, frame):
+            frame["seq"] = 1
+            frame["event_id"] = "event_1"
+            adapter._chat_event_logs.get_or_create(frame["chat_id"]).append("push", dict(frame))
+            await adapter._fake_client.send(frame)
+
+    adapter._chat_cursors = FakePushRelay()
+    result = await adapter.send_image_file(
+        chat_id="chat_a",
+        image_path=str(image_path),
+        caption="Here it is:",
+    )
+
+    assert result.success is True
+    pushes = [frame for frame in adapter._fake_client.sent if frame["type"] == "push"]
+    assert pushes
+    assert pushes[-1]["chat_id"] == "inbox"
+    frames = [
+        frame
+        for frame in adapter._fake_client.sent
+        if frame["type"] == adapter_mod.FRAME_CHAT_INDEX_CHANGED
+    ]
+    assert frames
+    assert frames[-1]["instance_id"] == "inst_1"
+    assert frames[-1]["chat_id"] == "inbox"
+    assert frames[-1]["chat"]["preview"]["last_message_preview"] == "Here it is:"
+
+
+@pytest.mark.asyncio
 async def test_turn_cancel_action_cancels_active_session(adapter):
     async def handler(event):
         if event.text == "/stop":

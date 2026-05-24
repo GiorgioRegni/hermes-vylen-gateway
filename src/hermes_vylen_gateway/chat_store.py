@@ -1234,10 +1234,12 @@ def _chat_from_row(row: sqlite3.Row) -> ChatRow:
 
 
 def _preview_from_event(kind: str, payload: dict[str, Any], occurred_at: str) -> tuple[str, str, str] | None:
-    if kind not in {"message.created", "message.updated"}:
+    if kind not in {"message.created", "message.updated", "push"}:
         return None
     text = str(payload.get("text") or "").strip()
+    if not text and kind == "push" and payload.get("image_token"):
+        text = "Image"
     if not text:
         return None
-    role = str(payload.get("role") or "")
+    role = str(payload.get("role") or ("hermes" if kind == "push" else ""))
     return (text[:240], role, str(payload.get("created_at") or occurred_at))
