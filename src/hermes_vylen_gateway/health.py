@@ -14,6 +14,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from .agent_runner import check_available
+from .resource_pressure import ResourcePressureSampler
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +33,12 @@ class HealthReporter:
         send_frame: Callable[[dict[str, Any]], Awaitable[None]],
         interval_s: float | None = None,
         chat_state_status: Callable[[], Any] | None = None,
+        resource_sampler: ResourcePressureSampler | None = None,
     ):
         self._send = send_frame
         self._interval = interval_s if interval_s is not None else _interval_from_env()
         self._chat_state_status = chat_state_status
+        self._resource_sampler = resource_sampler
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -77,6 +80,11 @@ class HealthReporter:
         }
         if last_error is not None:
             frame["last_error"] = last_error
+        if self._resource_sampler is not None:
+            try:
+                frame["resource_pressure"] = self._resource_sampler.sample()
+            except Exception:  # noqa: BLE001
+                frame["resource_pressure"] = {"cpu": "unknown", "memory": "unknown"}
         if self._chat_state_status is not None:
             try:
                 chat_status = self._chat_state_status()

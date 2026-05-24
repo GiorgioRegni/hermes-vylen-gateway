@@ -42,6 +42,7 @@ from .event_log import EventTooLarge
 from .health import HealthReporter
 from .memory import FRAME_MEMORY_REQUEST, MemoryRPC
 from .relay import FRAME_REQUEST, FRAME_RESPONSE_RESUME, HermesRelay
+from .resource_pressure import build_resource_pressure_sampler_from_env
 from .response_buffer import ResponseBufferRegistry
 from .transcribe import FRAME_TRANSCRIBE, Transcriber
 
@@ -532,7 +533,11 @@ def make_adapter_class():
                 self._chat_event_logs,
                 disabled=bool(os.environ.get("VYLEN_CHAT_CURSOR_DISABLE")),
             )
-            self._health = HealthReporter(client.send, chat_state_status=lambda: self._chat_event_logs.status)
+            self._health = HealthReporter(
+                client.send,
+                chat_state_status=lambda: self._chat_event_logs.status,
+                resource_sampler=build_resource_pressure_sampler_from_env(),
+            )
             self._health.start()
             self._transcribe = Transcriber(client.send)
             self._memory = MemoryRPC(client.send)
