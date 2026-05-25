@@ -2260,7 +2260,7 @@ async def test_choice_clarify_rejects_text_response_without_resolving(adapter, m
         "text": "Something else",
     })
 
-    assert calls["clarify"] == [("clarify_1", "")]
+    assert calls["clarify"] == []
     assert "clarify_1" in adapter._action_cards
     errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
     assert errors[-1]["request_id"] == "clarify_text_req"
@@ -2288,7 +2288,7 @@ async def test_choice_clarify_rejects_unknown_choice_without_resolving(adapter, 
         "choice": "Other",
     })
 
-    assert calls["clarify"] == [("clarify_1", "")]
+    assert calls["clarify"] == []
     assert "clarify_1" in adapter._action_cards
     errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_action_error"]
     assert errors[-1]["request_id"] == "clarify_unknown_req"
