@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 
-from .adapter import adapter_factory, check_dependencies
+from .adapter import VYLEN_INBOX_CHAT_ID, adapter_factory, check_dependencies
 from .client import HandshakeError, ReadyInfo, VylenGatewayClient
 from .config import GatewayConfig, ConfigError, load_all_from_env, load_from_env
 
@@ -24,6 +24,19 @@ __all__ = [
     "load_all_from_env",
     "load_from_env",
 ]
+
+
+def _vylen_env_enablement() -> dict:
+    """Seed config.platforms[vylen] when the platform auto-enables.
+
+    Declares the Vylen home channel so the agent's send_message(target="vylen")
+    resolves to the notifications inbox bucket instead of erroring. The chat_id
+    is the same synthetic "inbox" bucket cron delivery and all plugin-initiated
+    pushes already use (Vylen fans out by user_id, not chat_id).
+    """
+    chat_id = (os.environ.get("VYLEN_HOME_CHAT_ID") or VYLEN_INBOX_CHAT_ID).strip() \
+        or VYLEN_INBOX_CHAT_ID
+    return {"home_channel": {"chat_id": chat_id, "name": "Vylen"}}
 
 
 def register(ctx) -> None:
@@ -62,6 +75,10 @@ def register(ctx) -> None:
         allowed_users_env="VYLEN_ALLOWED_USERS",
         allow_all_env="VYLEN_ALLOW_ALL_USERS",
         cron_deliver_env_var="VYLEN_HOME_CHAT_ID",
+        # Makes send_message(target="vylen") resolve the home channel to the
+        # notifications inbox bucket; reuses VYLEN_HOME_CHAT_ID so cron and
+        # send_message agree on the bucket.
+        env_enablement_fn=_vylen_env_enablement,
     )
 
 

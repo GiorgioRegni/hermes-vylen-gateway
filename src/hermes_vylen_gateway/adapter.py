@@ -234,6 +234,7 @@ def make_adapter_class():
             self._memory: MemoryRPC | None = None
             self._commands: CommandsRPC | None = None
             self._chat_cursors: ChatCursorRelay | None = None
+            self._gateway_loop: asyncio.AbstractEventLoop | None = None
             self._chat_event_logs = ChatStateStore.from_env()
             self._accepted_chat_messages: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
             self._accepted_chat_messages_max = _env_int("VYLEN_CHAT_MESSAGE_DEDUP_MAX", 5000)
@@ -508,6 +509,7 @@ def make_adapter_class():
             self._client = client
             self._connected_gateway_cfg = gateway_cfg
             self._instance_id = ready.instance_id
+            self._gateway_loop = asyncio.get_running_loop()
             if hasattr(self._chat_event_logs, "set_event_loop"):
                 self._chat_event_logs.set_event_loop(asyncio.get_running_loop())
             _authorize_vylen_user(ready.user_id)
@@ -700,12 +702,32 @@ def make_adapter_class():
                 frame["cron_job_id"] = cron_job_id
             if cron_job_name:
                 frame["cron_job_name"] = cron_job_name
-            try:
+
+            async def _emit() -> None:
                 if self._chat_cursors is not None:
                     await self._chat_cursors.send_push(frame)
                     await self._emit_chat_index_changed(frame["chat_id"])
                 else:
                     await self._client.send(frame)
+
+            # send_push's asyncio.Lock and the websocket are bound to the
+            # gateway loop. When invoked in-turn, model_tools._run_async runs
+            # this on a worker loop; awaiting those primitives there raises a
+            # different-loop RuntimeError. Marshal back to the gateway loop
+            # only when it's set, running, and not the current loop — never
+            # onto a stopped/missing loop.
+            try:
+                gateway_loop = self._gateway_loop
+                running_loop = asyncio.get_running_loop()
+                if (
+                    gateway_loop is not None
+                    and gateway_loop is not running_loop
+                    and gateway_loop.is_running()
+                ):
+                    fut = asyncio.run_coroutine_threadsafe(_emit(), gateway_loop)
+                    await asyncio.wrap_future(fut)
+                else:
+                    await _emit()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("vylen gateway: push frame send failed: %s", exc)
                 return SendResult(success=False, error=str(exc), retryable=True)

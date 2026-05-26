@@ -3019,3 +3019,68 @@ async def test_append_threshold_sweep_schedules_from_event_loop(adapter):
 
     assert registry.consumed == 1
     assert registry.swept == 1
+
+
+@pytest.mark.asyncio
+async def test_plugin_initiated_push_marshals_onto_gateway_loop(adapter):
+    """send() from a foreign loop must marshal the push onto the gateway loop.
+
+    Uses a real ChatCursorRelay (real asyncio.Lock) and a client whose send is
+    loop-bound, so the test fails with a different-loop RuntimeError if the
+    marshaling regresses.
+    """
+    import threading
+
+    class LoopBoundClient:
+        def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+            self._loop = loop
+            self.sent: list[dict[str, Any]] = []
+
+        async def send(self, frame: dict[str, Any]) -> None:
+            assert asyncio.get_running_loop() is self._loop
+            self.sent.append(dict(frame))
+
+    loop_a = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def _run_loop_a() -> None:
+        asyncio.set_event_loop(loop_a)
+        loop_a.call_soon(ready.set)
+        loop_a.run_forever()
+
+    thread = threading.Thread(target=_run_loop_a, daemon=True)
+    thread.start()
+    ready.wait()
+
+    try:
+        client = LoopBoundClient(loop_a)
+
+        async def _bind_relay() -> ChatCursorRelay:
+            # Construct the relay (and its asyncio.Lock) on loop A so the
+            # primitive is bound there, mirroring connect-time setup.
+            return ChatCursorRelay(client.send, adapter._chat_event_logs)
+
+        relay = asyncio.run_coroutine_threadsafe(_bind_relay(), loop_a).result()
+        adapter._client = client
+        adapter._chat_cursors = relay
+        adapter._chat_event_logs.set_event_loop(loop_a)
+        adapter._gateway_loop = loop_a
+
+        # The test coroutine runs on loop B (pytest-asyncio's loop).
+        assert asyncio.get_running_loop() is not loop_a
+        result = await adapter.send("inbox", "hello")
+        assert result.success is True
+
+        pushes = [frame for frame in client.sent if frame["type"] == "push"]
+        assert len(pushes) == 1
+        assert pushes[0]["chat_id"] == "inbox"
+    finally:
+        # Drain loop A's executor before stopping so to_thread workers from
+        # send_push don't linger in the shared default pool and perturb the
+        # timing of the next test (which uses the real asyncio.to_thread).
+        asyncio.run_coroutine_threadsafe(
+            loop_a.shutdown_default_executor(), loop_a
+        ).result(timeout=5)
+        loop_a.call_soon_threadsafe(loop_a.stop)
+        thread.join(timeout=5)
+        loop_a.close()

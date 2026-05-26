@@ -101,6 +101,19 @@ when the user has not provided a value. Vylen routes by the paired instance and
 owning user, so the chat id is a compatibility bucket for Hermes' delivery
 resolver.
 
+The same outbound path is also reachable from the agent's
+`send_message(target="vylen")` tool. `register()` declares an
+`env_enablement_fn` that returns a `home_channel` whose `chat_id` is read from
+the same `VYLEN_HOME_CHAT_ID` (`inbox`) bucket, so cron `--deliver vylen` and
+`send_message(target="vylen")` agree on the bucket. Hermes wires that into
+`config.platforms[vylen].home_channel`, so bare-platform
+`send_message(target="vylen")` resolves to `inbox` instead of erroring with
+`No home channel set`.
+
+Unlike cron, the in-turn `send_message` tool path can call `adapter.send` from
+a worker loop. `send()` marshals the push coroutine back onto the gateway loop
+when needed because the push lock and websocket are bound to that loop.
+
 Hermes may wrap cron output in a text envelope before calling `send()`. The
 plugin strips the common envelope form and sends structured `cron_job_id` and
 `cron_job_name` fields when they are available.
