@@ -144,7 +144,7 @@ class FakeBasePlatformAdapter:
 
 
 @pytest.fixture
-def adapter(monkeypatch, tmp_path):
+async def adapter(monkeypatch, tmp_path):
     monkeypatch.setenv("VYLEN_CHAT_STATE_DB_PATH", str(tmp_path / "chat-state.sqlite3"))
     gateway_mod = types.ModuleType("gateway")
     platforms_mod = types.ModuleType("gateway.platforms")
@@ -173,7 +173,7 @@ def adapter(monkeypatch, tmp_path):
     client = FakeClient()
     instance._instance_id = "inst_1"
     instance._client = client
-    instance._chat_event_logs.set_event_loop(asyncio.get_event_loop())
+    instance._chat_event_logs.set_event_loop(asyncio.get_running_loop())
     instance._chat_cursors = ChatCursorRelay(client.send, instance._chat_event_logs)
     instance._fake_client = client
     return instance
@@ -598,7 +598,7 @@ async def test_runner_turn_lifecycle_wrapper_uses_latest_adapter_after_reconnect
     second_client = FakeClient()
     second_adapter._instance_id = "inst_2"
     second_adapter._client = second_client
-    second_adapter._chat_event_logs.set_event_loop(asyncio.get_event_loop())
+    second_adapter._chat_event_logs.set_event_loop(asyncio.get_running_loop())
     second_adapter._chat_cursors = ChatCursorRelay(second_client.send, second_adapter._chat_event_logs)
     second_adapter._fake_client = second_client
     runner.adapter = second_adapter
