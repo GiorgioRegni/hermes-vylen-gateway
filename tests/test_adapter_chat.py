@@ -195,6 +195,15 @@ def _chat_message_frame(**overrides):
     return frame
 
 
+def assert_all_message_updates_have_message_id(events):
+    missing = [
+        event
+        for event in events
+        if event.kind == "message.updated" and not event.payload.get("message_id")
+    ]
+    assert missing == []
+
+
 def test_authorize_vylen_user_merges_cloud_ready_user(monkeypatch):
     monkeypatch.setenv("VYLEN_ALLOWED_USERS", "existing")
 
@@ -540,6 +549,7 @@ async def test_runner_drained_queued_turn_gets_its_own_lifecycle_and_output(adap
     )
 
     events = adapter._chat_event_logs.get("chat_a").events
+    assert_all_message_updates_have_message_id(events)
     started = [event for event in events if event.kind == "turn.started"]
     completed = [event for event in events if event.kind == "turn.completed"]
     queued_user_updates = [
@@ -1606,6 +1616,7 @@ async def test_message_lifecycle_creates_and_finalizes_assistant_message(adapter
     await adapter._handle_chat_message(_chat_message_frame())
 
     events = adapter._chat_event_logs.get("chat_a").events
+    assert_all_message_updates_have_message_id(events)
     assistant_created = [
         event for event in events
         if event.kind == "message.created" and event.payload.get("role") == "hermes"
@@ -1634,6 +1645,7 @@ async def test_processing_complete_finalizes_non_streaming_assistant_message(ada
     await adapter._handle_chat_message(_chat_message_frame())
 
     events = adapter._chat_event_logs.get("chat_a").events
+    assert_all_message_updates_have_message_id(events)
     assistant_id = next(
         event.payload["message_id"]
         for event in events
