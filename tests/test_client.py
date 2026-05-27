@@ -13,6 +13,7 @@ import pytest
 import websockets
 from websockets.asyncio.server import serve as ws_serve
 
+import hermes_vylen_gateway.client as client_module
 from hermes_vylen_gateway.client import (
     FRAME_HELLO,
     FRAME_READY,
@@ -35,6 +36,28 @@ def _config_for(port: int, token: str = "vyl_live_test") -> GatewayConfig:
         cloud_url=f"http://127.0.0.1:{port}",
         websocket_url=f"ws://127.0.0.1:{port}/v1/gateway",
     )
+
+
+def test_hello_meta_detects_installed_hermes_version(monkeypatch):
+    requested: list[str] = []
+
+    def version(name: str) -> str:
+        requested.append(name)
+        return "0.14.0"
+
+    monkeypatch.setattr(client_module.importlib_metadata, "version", version)
+
+    assert HelloMeta(hostname="ci").to_dict()["hermes_version"] == "0.14.0"
+    assert requested == ["hermes-agent"]
+
+
+def test_hello_meta_omits_missing_hermes_version(monkeypatch):
+    def missing(_name: str) -> str:
+        raise client_module.importlib_metadata.PackageNotFoundError("hermes-agent")
+
+    monkeypatch.setattr(client_module.importlib_metadata, "version", missing)
+
+    assert "hermes_version" not in HelloMeta(hostname="ci").to_dict()
 
 
 async def _expect_authorized(ws) -> bool:

@@ -7,6 +7,7 @@ Standalone of Hermes — both the adapter (production path) and the doctor CLI
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata as importlib_metadata
 import json
 import logging
 import platform as _platform
@@ -30,6 +31,13 @@ FRAME_ERROR = "error"
 PLUGIN_VERSION = "0.1.0"
 
 
+def _detect_hermes_version() -> Optional[str]:
+    try:
+        return importlib_metadata.version("hermes-agent")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
 @dataclass
 class ReadyInfo:
     instance_id: str
@@ -45,7 +53,7 @@ class HelloMeta:
     plugin_version: str = PLUGIN_VERSION
     hostname: str = field(default_factory=socket.gethostname)
     python_version: str = field(default_factory=_platform.python_version)
-    hermes_version: Optional[str] = None
+    hermes_version: Optional[str] = field(default_factory=_detect_hermes_version)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
