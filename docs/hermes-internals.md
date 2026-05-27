@@ -125,6 +125,14 @@ The common Hermes container layout is:
 - Hermes home at `/opt/data`;
 - Hermes virtualenv at `/opt/hermes/.venv`;
 - Hermes binary at `/opt/hermes/.venv/bin/hermes`.
+- The process user is `hermes` (UID 10000), not the host user. `docker exec`
+  and `docker compose exec` default to root, so maintenance commands like
+  `hermes login` or `hermes model` can rewrite
+  `/opt/data/{.env,auth.json,config.yaml}` as `root:root`. Run maintenance as
+  the gateway user with
+  `docker exec -u hermes hermes /opt/hermes/.venv/bin/hermes <cmd>`. Recover
+  from a root-owned file with
+  `docker exec -u 0 hermes chown hermes:hermes /opt/data/<file>`.
 
 Container recreation can wipe packages installed into the virtualenv. If the
 container is recreated, reinstall the package into that environment:
