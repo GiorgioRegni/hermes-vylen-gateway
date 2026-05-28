@@ -92,6 +92,7 @@ class FakeMessageEvent:
     message_id: str | None = None
     media_urls: list[str] = field(default_factory=list)
     media_types: list[str] = field(default_factory=list)
+    channel_context: str | None = None
 
 
 class FakeBasePlatformAdapter:
@@ -357,6 +358,104 @@ async def test_chat_message_deduplicates_by_chat_and_client_message_id(adapter):
     assert len(acks) == 2
     assert acks[0]["turn_id"] == acks[1]["turn_id"]
     assert len(handled) == 1
+
+
+def test_chat_message_reply_context_reaches_channel_context_only(adapter):
+    event = adapter._build_message_event(
+        frame=_chat_message_frame(
+            text="Summarize in 4 bullet points",
+            reply_context={"text": "Daily Market-Research Update\n- one\n- two"},
+        ),
+        chat_id="chat_a",
+        text="Summarize in 4 bullet points",
+        user_message_id="msg_user_1",
+        turn_id="turn_1",
+        media_urls=[],
+        media_types=[],
+    )
+
+    assert event.text == "Summarize in 4 bullet points"
+    assert event.channel_context == "[Notification being replied to]\nDaily Market-Research Update\n- one\n- two"
+    assert "reply_context" not in event.raw_message
+
+    adapter._append_chat_event_sync("chat_a", "message.created", {
+        "message_id": "msg_user_1",
+        "role": "user",
+        "text": "Summarize in 4 bullet points",
+        "status": "running",
+        "created_at": "2026-05-28T00:00:00Z",
+        "turn_id": "turn_1",
+        "client_message_id": "client_msg_1",
+    })
+    retained = [
+        event
+        for event in adapter._chat_event_logs.get("chat_a").events
+        if event.kind == "message.created" and event.payload.get("role") == "user"
+    ]
+    assert len(retained) == 1
+    payload = retained[0].payload
+    assert payload["text"] == "Summarize in 4 bullet points"
+    assert "reply_context" not in payload
+    assert "Daily Market-Research Update" not in str(payload)
+
+    replayed = adapter._chat_event_logs.replay_after("chat_a", 0)
+    assert all("reply_context" not in event.payload for event in replayed)
+    assert all("Daily Market-Research Update" not in str(event.payload) for event in replayed)
+
+
+@pytest.mark.asyncio
+async def test_chat_message_reply_context_is_redacted_from_failure_events(adapter, monkeypatch):
+    monkeypatch.setattr(asyncio, "to_thread", _run_sync_as_async)
+    hidden = "Daily Market-Research Update\n- secret one\n- secret two"
+    event = adapter._build_message_event(
+        frame=_chat_message_frame(
+            text="Summarize in 4 bullet points",
+            reply_context={"text": hidden},
+        ),
+        chat_id="chat_a",
+        text="Summarize in 4 bullet points",
+        user_message_id="msg_user_1",
+        turn_id="turn_1",
+        media_urls=[],
+        media_types=[],
+    )
+
+    async def failing_handle_message(received):
+        raise ValueError(f"bad event {received!r}")
+
+    adapter.handle_message = failing_handle_message
+
+    await adapter._process_chat_message("chat_a", "msg_user_1", "turn_1", event)
+
+    retained = adapter._chat_event_logs.get("chat_a").events
+    failure_payloads = [
+        retained_event.payload
+        for retained_event in retained
+        if retained_event.kind in {"turn.failed", "message.updated"}
+    ]
+    assert failure_payloads
+    assert all(payload.get("error") == "Message processing failed" for payload in failure_payloads)
+    assert all("Daily Market-Research Update" not in str(payload) for payload in failure_payloads)
+    replayed = adapter._chat_event_logs.replay_after("chat_a", 0)
+    assert all("Daily Market-Research Update" not in str(event.payload) for event in replayed)
+
+
+@pytest.mark.asyncio
+async def test_chat_message_reply_context_is_redacted_from_error_frame(adapter):
+    hidden = "Daily Market-Research Update"
+
+    await adapter._send_chat_message_error(
+        _chat_message_frame(reply_context={"text": hidden}),
+        "CHAT_STATE_FAILED",
+        f"bad frame {hidden}",
+    )
+
+    errors = [frame for frame in adapter._fake_client.sent if frame["type"] == "chat_message_error"]
+    assert errors
+    assert errors[-1]["code"] == "CHAT_STATE_FAILED"
+    assert errors[-1]["message"] == "Message processing failed"
+    assert hidden not in str(errors[-1])
+    assert "reply_context" not in str(errors[-1])
 
 
 @pytest.mark.asyncio

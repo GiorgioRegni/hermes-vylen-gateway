@@ -1318,19 +1318,25 @@ def make_adapter_class():
             try:
                 await self.handle_message(event)
             except Exception as exc:  # noqa: BLE001
+                error = self._chat_processing_error_for_event(exc, event)
                 await self._append_chat_event_async(chat_id, "turn.failed", {
                     "turn_id": turn_id,
                     "message_id": user_message_id,
-                    "error": str(exc),
+                    "error": error,
                     "failed_at": _utc_iso(),
                 })
                 await self._append_chat_event_async(chat_id, "message.updated", {
                     "message_id": user_message_id,
                     "turn_id": turn_id,
                     "status": "failed",
-                    "error": str(exc),
+                    "error": error,
                     "updated_at": _utc_iso(),
                 })
+
+        def _chat_processing_error_for_event(self, exc: Exception, event: Any) -> str:
+            if getattr(event, "channel_context", None):
+                return "Message processing failed"
+            return str(exc)
 
         def _has_pending_input_card(self, session_key: str, input_kind: str) -> bool:
             if not session_key:
@@ -2485,8 +2491,15 @@ def make_adapter_class():
                 message_id=user_message_id,
             )
             raw_message = dict(frame)
+            raw_message.pop("reply_context", None)
             raw_message["turn_id"] = turn_id
             raw_message["user_message_id"] = user_message_id
+            reply_context = frame.get("reply_context")
+            channel_context = ""
+            if isinstance(reply_context, dict):
+                context_text = reply_context.get("text")
+                if isinstance(context_text, str) and context_text.strip():
+                    channel_context = "[Notification being replied to]\n" + context_text
             return MessageEvent(
                 text=text,
                 message_type=message_type,
@@ -2495,6 +2508,7 @@ def make_adapter_class():
                 message_id=user_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+                channel_context=channel_context or None,
             )
 
         def _build_command_event(self, *, source: Any, text: str, turn_id: str):
@@ -3347,6 +3361,8 @@ def make_adapter_class():
                 self._action_cards.pop(action_id, None)
 
         async def _send_chat_message_error(self, frame: dict[str, Any], code: str, message: str) -> None:
+            if frame.get("reply_context") is not None:
+                message = "Message processing failed"
             await self._send_frame({
                 "type": FRAME_CHAT_MESSAGE_ERROR,
                 "request_id": str(frame.get("request_id") or ""),
